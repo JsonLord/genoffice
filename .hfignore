@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+apps/*/node_modules
+packages/*/node_modules
+.venv
+dist
+release
+*.log
+e2e
+fixtures
+ee
+tools
+website
+packaging
