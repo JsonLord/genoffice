@@ -47,9 +47,32 @@ startChild('slides', 'npm', ['start'], {
   env: { PORT: '3002', HOST: '127.0.0.1', STATIC_DIR: '/app/slides/apps/web/dist' },
 });
 
+// OpenAI-compatible provider, sourced from Space secrets. `{env:VAR}` is
+// OpenCode's own config-time substitution syntax (applied to the raw config
+// text before it's parsed) — passing it through literally here, rather than
+// reading process.env ourselves, means a secret rotated in the Space
+// settings takes effect on the next container restart without editing this
+// file, and an unset secret degrades to an empty string instead of a crash.
+const OPENCODE_CONFIG_CONTENT = JSON.stringify({
+  $schema: 'https://opencode.ai/config.json',
+  provider: {
+    'openai-compatible': {
+      npm: '@ai-sdk/openai-compatible',
+      options: {
+        baseURL: '{env:COMPATIBLE_URL}',
+        apiKey: '{env:COMPATIBLE_API_KEY}',
+      },
+      models: {
+        '{env:COMPATIBLE_MODEL}': {},
+      },
+    },
+  },
+  model: 'openai-compatible/{env:COMPATIBLE_MODEL}',
+});
+
 startChild('opencode', 'opencode', ['serve', '--hostname', '127.0.0.1', '--port', '4096'], {
   cwd: '/app',
-  env: {},
+  env: { OPENCODE_CONFIG_CONTENT },
 });
 
 // ─── Reverse proxy ─────────────────────────────────────────────────────────
@@ -145,6 +168,15 @@ function isChatAuthed(req) {
   return readCookie(req, CHAT_COOKIE) === CHAT_ACCESS_CODE;
 }
 
+// Same access code as the chat sidebar, but via `Authorization: Bearer …`
+// instead of a cookie — for external MCP/API clients that can set a header
+// but can't run the sidebar's browser login form.
+function isApiAuthed(req) {
+  const auth = req.headers.authorization || '';
+  const bearer = auth.match(/^Bearer\s+(.+)$/i);
+  return !!bearer && bearer[1] === CHAT_ACCESS_CODE;
+}
+
 function chatGateHtml(error) {
   return `<!doctype html><html><head><meta charset="utf-8"><title>OpenCode — locked</title>
 <style>body{font:14px system-ui,sans-serif;background:#0b0d12;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
@@ -183,8 +215,10 @@ const server = http.createServer((req, res) => {
         '<p>Three open-source apps behind one proxy:</p>' +
         '<ul><li><code>/</code> — Casual Docs (.docx editor)</li>' +
         '<li><code>/slides/</code> — Casual Slides (.pptx editor)</li>' +
-        '<li><code>/chat/</code> — OpenCode AI chat (access-code gated, also embedded as a sidebar on the Docs page)</li></ul>' +
-        '<p><code>/health</code> — liveness probe</p></body>',
+        '<li><code>/chat/</code> — OpenCode AI chat (browser sidebar, cookie-gated by an access code)</li>' +
+        '<li><code>/api/</code> — same OpenCode backend for MCP/API clients — send <code>Authorization: Bearer &lt;access code&gt;</code></li></ul>' +
+        '<p><code>/health</code> — liveness probe</p>' +
+        '<p>The access code for both is printed to the container logs at startup.</p></body>',
     );
     return;
   }
@@ -221,6 +255,21 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Programmatic/MCP access to OpenCode's API — same backend and access
+  // code as /chat, but header-authed instead of cookie-authed since a
+  // non-browser client can't run the sidebar's login form. No HTML rewrite
+  // here: this path is for JSON/API calls, not for rendering the chat UI.
+  if (url === '/api' || url.startsWith('/api/')) {
+    if (!isApiAuthed(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing or invalid Authorization: Bearer <access code>' }));
+      return;
+    }
+    req.url = stripPrefix(url, '/api');
+    proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
+    return;
+  }
+
   if (url === '/slides' || url.startsWith('/slides/')) {
     req.url = stripPrefix(url, '/slides');
     // selfHandleResponse: true on every route here — the shared `proxyRes`
@@ -245,6 +294,15 @@ server.on('upgrade', (req, socket, head) => {
       return;
     }
     req.url = stripPrefix(url, '/chat');
+    proxy.ws(req, socket, head, { target: CHAT_TARGET });
+    return;
+  }
+  if (url === '/api' || url.startsWith('/api/')) {
+    if (!isApiAuthed(req)) {
+      socket.destroy();
+      return;
+    }
+    req.url = stripPrefix(url, '/api');
     proxy.ws(req, socket, head, { target: CHAT_TARGET });
     return;
   }
