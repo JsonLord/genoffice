@@ -1,328 +1,267 @@
 import http from 'node:http';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import httpProxy from 'http-proxy';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const PORT = Number(process.env.PORT || 7860);
 
-const PORT = process.env.PORT || 7860;
+// ─── Access code for the embedded OpenCode chat ──────────────────────────
+// OpenCode is a coding agent with shell/file tool access in this container.
+// Its own server has no auth by default (OPENCODE_SERVER_PASSWORD unset —
+// it's only ever reached through this proxy, never exposed directly), so
+// this process gates every /chat request itself with a random code, printed
+// once to the container's stdout logs (visible to the Space owner under the
+// "Logs" tab, never to visitors) rather than baked into the image or shipped
+// to the browser.
+const CHAT_ACCESS_CODE = crypto.randomBytes(9).toString('base64url');
+const CHAT_COOKIE = 'oc_auth';
 
-const API_DOCS_HTML = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OpenUI Cowork - API Documentation</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; max-width: 900px; margin: 0 auto; padding: 2rem; color: #1a1a1a; background-color: #f8f9fa; }
-    h1 { color: #0d6efd; border-bottom: 2px solid #e9ecef; padding-bottom: 0.5rem; }
-    h2 { margin-top: 2rem; color: #343a40; }
-    .endpoint { background: #ffffff; border: 1px solid #e0e0e0; border-radius: 8px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    .method { display: inline-block; padding: 0.25rem 0.6rem; font-weight: bold; border-radius: 4px; color: white; font-size: 0.85rem; }
-    .get { background-color: #198754; }
-    .post { background-color: #0d6efd; }
-    .path { font-family: monospace; font-size: 1.1rem; font-weight: bold; margin-left: 0.5rem; }
-    pre { background: #212529; color: #f8f9fa; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.9rem; }
-    .badge { background: #6c757d; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; }
-  </style>
-</head>
-<body>
-  <h1>OpenUI Cowork API Documentation</h1>
-  <p>Welcome to the API documentation for <strong>OpenUI Cowork (GenOffice Suite)</strong> deployed on Hugging Face Spaces.</p>
+console.log('════════════════════════════════════════════════════════════');
+console.log(' OpenCode chat access code (enter this in the chat sidebar):');
+console.log(' ' + CHAT_ACCESS_CODE);
+console.log('════════════════════════════════════════════════════════════');
 
-  <div class="endpoint">
-    <h3><span class="method get">GET</span> <span class="path">/health</span></h3>
-    <p><strong>Purpose:</strong> Readiness probe and health check. Returns HTTP 200 when ready.</p>
-    <h4>Response Example:</h4>
-    <pre><code>{
-  "status": "healthy",
-  "timestamp": "2025-01-01T00:00:00.000Z",
-  "service": "openui-cowork"
-}</code></pre>
+// ─── Child processes ──────────────────────────────────────────────────────
+const children = [];
+
+function startChild(name, cmd, args, opts) {
+  const child = spawn(cmd, args, {
+    stdio: ['ignore', 'inherit', 'inherit'],
+    ...opts,
+    env: { ...process.env, ...opts.env },
+  });
+  child.on('exit', (code, signal) => {
+    console.error(`[${name}] exited (code=${code} signal=${signal}) — not restarting`);
+  });
+  children.push({ name, child });
+  return child;
+}
+
+startChild('docs', 'npm', ['start'], {
+  cwd: '/app/docs/collab',
+  env: { PORT: '8080', HOST: '127.0.0.1', CASUAL_FILE_EXT: '.docx', TRUST_PROXY: 'true' },
+});
+
+startChild('slides', 'npm', ['start'], {
+  cwd: '/app/slides/apps/server',
+  env: { PORT: '3002', HOST: '127.0.0.1', STATIC_DIR: '/app/slides/apps/web/dist' },
+});
+
+startChild('opencode', 'opencode', ['serve', '--hostname', '127.0.0.1', '--port', '4096'], {
+  cwd: '/app',
+  env: {},
+});
+
+// ─── Reverse proxy ─────────────────────────────────────────────────────────
+const DOCS_TARGET = { host: '127.0.0.1', port: 8080 };
+const SLIDES_TARGET = { host: '127.0.0.1', port: 3002 };
+const CHAT_TARGET = { host: '127.0.0.1', port: 4096 };
+
+const proxy = httpProxy.createProxyServer({ ws: true });
+proxy.on('error', (err, req, res) => {
+  console.error('proxy error:', err.message);
+  if (res && !res.headersSent && typeof res.writeHead === 'function') {
+    res.writeHead(502, { 'Content-Type': 'text/plain' });
+    res.end('Bad gateway — the backend for this route is still starting up. Try again shortly.');
+  }
+});
+
+// Injects a collapsible OpenCode chat sidebar into any HTML page the Docs
+// app serves (its own index.html, SPA-fallback pages, etc.) — Docs itself
+// knows nothing about this; we splice it into the response in flight.
+const SIDEBAR_HTML = `
+<div id="__oc_tab" style="position:fixed;top:50%;right:0;transform:translateY(-50%);z-index:2147483000;background:#111827;color:#fff;padding:10px 8px;border-radius:8px 0 0 8px;cursor:pointer;font:600 12px system-ui,sans-serif;writing-mode:vertical-rl;box-shadow:-2px 0 8px rgba(0,0,0,.2);">AI Chat</div>
+<div id="__oc_panel" style="position:fixed;top:0;right:-420px;width:400px;height:100vh;z-index:2147483001;background:#0b0d12;box-shadow:-4px 0 16px rgba(0,0,0,.35);transition:right .2s ease;">
+  <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#111827;color:#fff;font:600 13px system-ui,sans-serif;">
+    <span>OpenCode</span>
+    <span id="__oc_close" style="cursor:pointer;opacity:.7;padding:2px 6px;">✕</span>
   </div>
-
-  <div class="endpoint">
-    <h3><span class="method get">GET</span> <span class="path">/api-docs</span></h3>
-    <p><strong>Purpose:</strong> Serves interactive HTML/JSON documentation for all endpoints.</p>
-  </div>
-
-  <div class="endpoint">
-    <h3><span class="method post">POST</span> <span class="path">/predict</span></h3>
-    <p><strong>Purpose:</strong> AI document processing and text generation inference.</p>
-    <h4>Request Example:</h4>
-    <pre><code>{
-  "prompt": "Draft a summary for quarterly sales report",
-  "app": "docs"
-}</code></pre>
-    <h4>Response Example:</h4>
-    <pre><code>{
-  "status": "success",
-  "generated_text": "Quarterly Sales Report Summary...",
-  "app": "docs"
-}</code></pre>
-  </div>
-
-  <div class="endpoint">
-    <h3><span class="method post">POST</span> <span class="path">/api/parse</span></h3>
-    <p><strong>Purpose:</strong> Parse structure and metadata from uploaded office files.</p>
-    <h4>Request Example:</h4>
-    <pre><code>{
-  "filename": "document.docx",
-  "content_base64": "..."
-}</code></pre>
-    <h4>Response Example:</h4>
-    <pre><code>{
-  "status": "success",
-  "filename": "document.docx",
-  "parsed_type": "document",
-  "sections_count": 5
-}</code></pre>
-  </div>
-
-  <div class="endpoint">
-    <h3><span class="method get">GET</span> <span class="path">/api/apps</span></h3>
-    <p><strong>Purpose:</strong> List all hosted GenOffice applications and their runtime status.</p>
-    <h4>Response Example:</h4>
-    <pre><code>{
-  "apps": [
-    { "id": "docs", "name": "GenOffice Docs", "status": "active", "path": "/docs/" },
-    { "id": "sheets", "name": "GenOffice Sheets", "status": "active", "path": "/sheets/" },
-    { "id": "slides", "name": "GenOffice Slides", "status": "active", "path": "/slides/" },
-    { "id": "pdf", "name": "GenOffice PDF", "status": "active", "path": "/pdf/" },
-    { "id": "markdown", "name": "GenOffice Markdown", "status": "active", "path": "/markdown/" }
-  ]
-}</code></pre>
-  </div>
-</body>
-</html>
+  <iframe id="__oc_iframe" src="/chat/" style="border:0;width:100%;height:calc(100% - 34px);background:#fff;"></iframe>
+</div>
+<script>
+(function () {
+  var tab = document.getElementById('__oc_tab');
+  var panel = document.getElementById('__oc_panel');
+  var close = document.getElementById('__oc_close');
+  function open() { panel.style.right = '0'; }
+  function shut() { panel.style.right = '-420px'; }
+  tab.addEventListener('click', open);
+  close.addEventListener('click', shut);
+})();
+</script>
 `;
 
-const MIME_TYPES = {
-  '.html': 'text/html; charset=UTF-8',
-  '.js': 'text/javascript; charset=UTF-8',
-  '.mjs': 'text/javascript; charset=UTF-8',
-  '.css': 'text/css; charset=UTF-8',
-  '.json': 'application/json; charset=UTF-8',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.gif': 'image/gif',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
-  '.woff': 'font/woff',
-  '.woff2': 'font/woff2',
-  '.ttf': 'font/ttf',
-  '.wasm': 'application/wasm',
-};
+function injectSidebar(html) {
+  const idx = html.lastIndexOf('</body>');
+  if (idx === -1) return html;
+  return html.slice(0, idx) + SIDEBAR_HTML + html.slice(idx);
+}
 
-function readRequestBody(req) {
-  return new Promise((resolve, reject) => {
+// OpenCode's UI bundle has no concept of being mounted under a subpath: its
+// HTML emits root-absolute asset tags (Vite's default `base: '/'`), and its
+// JS resolves its own API/WS base URL as `location.origin` (no path) unless
+// a `defaultServerUrl` override is sitting in localStorage before its entry
+// module runs. Both are fixed here rather than upstream: rewrite absolute
+// `src="/…"`/`href="/…"` tags to carry the `/chat` prefix our proxy expects,
+// and inject a pre-boot script that points the app's own API client back at
+// `/chat` (same trick self-hosted opencode.ai-style deployments would need).
+function rewriteChatHtml(html) {
+  const withPrefixedAssets = html.replace(/((?:src|href)=")\/(?!\/)/g, '$1/chat/');
+  const bootScript =
+    '<script>try{localStorage.setItem("opencode.settings.dat:defaultServerUrl",location.origin+"/chat")}catch(e){}</script>';
+  const headIdx = withPrefixedAssets.indexOf('<head>');
+  if (headIdx === -1) return bootScript + withPrefixedAssets;
+  const insertAt = headIdx + '<head>'.length;
+  return withPrefixedAssets.slice(0, insertAt) + bootScript + withPrefixedAssets.slice(insertAt);
+}
+
+proxy.on('proxyRes', (proxyRes, req, res) => {
+  const mode = req.__rewriteMode;
+  const contentType = proxyRes.headers['content-type'] || '';
+  if (!mode || !contentType.includes('text/html')) {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+    return;
+  }
+  const chunks = [];
+  proxyRes.on('data', (c) => chunks.push(c));
+  proxyRes.on('end', () => {
+    const html = Buffer.concat(chunks).toString('utf-8');
+    const rewritten = mode === 'docs-sidebar' ? injectSidebar(html) : rewriteChatHtml(html);
+    const body = Buffer.from(rewritten, 'utf-8');
+    const headers = { ...proxyRes.headers, 'content-length': Buffer.byteLength(body) };
+    res.writeHead(proxyRes.statusCode, headers);
+    res.end(body);
+  });
+});
+
+function readCookie(req, name) {
+  const raw = req.headers.cookie || '';
+  const match = raw.split(';').map((s) => s.trim()).find((s) => s.startsWith(name + '='));
+  return match ? decodeURIComponent(match.slice(name.length + 1)) : null;
+}
+
+function isChatAuthed(req) {
+  return readCookie(req, CHAT_COOKIE) === CHAT_ACCESS_CODE;
+}
+
+function chatGateHtml(error) {
+  return `<!doctype html><html><head><meta charset="utf-8"><title>OpenCode — locked</title>
+<style>body{font:14px system-ui,sans-serif;background:#0b0d12;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.box{max-width:280px;text-align:center}input{width:100%;padding:8px;margin:12px 0;border-radius:6px;border:1px solid #333;background:#111827;color:#fff;box-sizing:border-box}
+button{width:100%;padding:8px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}
+.err{color:#f87171;font-size:12px}</style></head>
+<body><div class="box"><p>Enter the access code from the Space owner's container logs.</p>
+<form method="POST" action="/chat-auth">
+<input name="code" autofocus placeholder="access code" autocomplete="off">
+<button type="submit">Unlock</button>
+${error ? '<p class="err">Incorrect code.</p>' : ''}
+</form></div></body></html>`;
+}
+
+function stripPrefix(url, prefix) {
+  if (url === prefix) return '/';
+  if (url.startsWith(prefix + '/')) return url.slice(prefix.length) || '/';
+  return null;
+}
+
+const server = http.createServer((req, res) => {
+  const url = req.url || '/';
+
+  if (url === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'healthy', timestamp: new Date().toISOString() }));
+    return;
+  }
+
+  if (url === '/api-docs') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=UTF-8' });
+    res.end(
+      '<!doctype html><title>OpenUI Cowork</title>' +
+        '<body style="font:14px system-ui,sans-serif;max-width:640px;margin:40px auto;line-height:1.6">' +
+        '<h1>OpenUI Cowork</h1>' +
+        '<p>Three open-source apps behind one proxy:</p>' +
+        '<ul><li><code>/</code> — Casual Docs (.docx editor)</li>' +
+        '<li><code>/slides/</code> — Casual Slides (.pptx editor)</li>' +
+        '<li><code>/chat/</code> — OpenCode AI chat (access-code gated, also embedded as a sidebar on the Docs page)</li></ul>' +
+        '<p><code>/health</code> — liveness probe</p></body>',
+    );
+    return;
+  }
+
+  if (req.method === 'POST' && url === '/chat-auth') {
     let body = '';
-    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('data', (c) => (body += c));
     req.on('end', () => {
-      try {
-        resolve(body ? JSON.parse(body) : {});
-      } catch (err) {
-        resolve({});
+      const params = new URLSearchParams(body);
+      const code = params.get('code') || '';
+      if (code === CHAT_ACCESS_CODE) {
+        res.writeHead(302, {
+          'Set-Cookie': `${CHAT_COOKIE}=${encodeURIComponent(code)}; Path=/; HttpOnly; SameSite=Lax`,
+          Location: '/chat/',
+        });
+        res.end();
+      } else {
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=UTF-8' });
+        res.end(chatGateHtml(true));
       }
     });
-    req.on('error', reject);
-  });
-}
-
-function sendJson(res, statusCode, data) {
-  res.writeHead(statusCode, {
-    'Content-Type': 'application/json; charset=UTF-8',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  });
-  res.end(JSON.stringify(data, null, 2));
-}
-
-function serveStaticFile(req, res, filePath) {
-  fs.stat(filePath, (err, stats) => {
-    if (err || !stats.isFile()) {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('404 Not Found');
-      return;
-    }
-
-    const ext = path.extname(filePath).toLowerCase();
-    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-
-    if (ext === '.html') {
-      fs.readFile(filePath, 'utf-8', (readErr, content) => {
-        if (readErr) {
-          res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end('Server Error');
-          return;
-        }
-        // Remove or relax restrictive Electron CSP meta tags for web/HuggingFace space iframe compatibility
-        const cleanedContent = content.replace(/<meta\s+http-equiv="Content-Security-Policy"[^>]*>/gi, '');
-        const buf = Buffer.from(cleanedContent, 'utf-8');
-        res.writeHead(200, {
-          'Content-Type': contentType,
-          'Content-Length': buf.length,
-          'Access-Control-Allow-Origin': '*',
-        });
-        res.end(buf);
-      });
-      return;
-    }
-
-    res.writeHead(200, {
-      'Content-Type': contentType,
-      'Content-Length': stats.size,
-      'Access-Control-Allow-Origin': '*',
-    });
-
-    fs.createReadStream(filePath).pipe(res);
-  });
-}
-
-const server = http.createServer(async (req, res) => {
-  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  const urlPath = parsedUrl.pathname;
-
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    });
-    res.end();
     return;
   }
 
-  // Mandatory /health endpoint
-  if (urlPath === '/health') {
-    return sendJson(res, 200, {
-      status: 'healthy',
-      timestamp: new Date().toISOString(),
-      service: 'openui-cowork'
-    });
-  }
-
-  // Mandatory /api-docs endpoint
-  if (urlPath === '/api-docs') {
-    if (req.headers.accept && req.headers.accept.includes('application/json')) {
-      return sendJson(res, 200, {
-        openapi: '3.0.0',
-        info: { title: 'OpenUI Cowork API', version: '1.0.0' },
-        paths: {
-          '/health': { get: { summary: 'Health check probe' } },
-          '/predict': { post: { summary: 'AI document generation' } },
-          '/api/parse': { post: { summary: 'Document structure parser' } },
-          '/api/apps': { get: { summary: 'List GenOffice applications' } },
-        }
-      });
+  if (url === '/chat' || url.startsWith('/chat/')) {
+    if (!isChatAuthed(req)) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=UTF-8' });
+      res.end(chatGateHtml(false));
+      return;
     }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=UTF-8' });
-    res.end(API_DOCS_HTML);
+    req.url = stripPrefix(url, '/chat');
+    req.__rewriteMode = 'chat-subpath';
+    proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
     return;
   }
 
-  // Functional Endpoint: /predict
-  if (urlPath === '/predict' && req.method === 'POST') {
-    const body = await readRequestBody(req);
-    const prompt = body.prompt || 'Hello OpenUI Cowork';
-    const app = body.app || 'docs';
-    return sendJson(res, 200, {
-      status: 'success',
-      app: app,
-      prompt: prompt,
-      generated_text: `[OpenUI Cowork Generated Result]: ${prompt}`,
-      timestamp: new Date().toISOString()
-    });
+  if (url === '/slides' || url.startsWith('/slides/')) {
+    req.url = stripPrefix(url, '/slides');
+    // selfHandleResponse: true on every route here — the shared `proxyRes`
+    // listener below is the only thing allowed to write `res` (registering
+    // it per-listener AND leaving http-proxy's own default auto-pipe active
+    // for routes that skip the flag would double-write the response).
+    proxy.web(req, res, { target: SLIDES_TARGET, selfHandleResponse: true });
+    return;
   }
 
-  // Functional Endpoint: /api/parse
-  if (urlPath === '/api/parse' && req.method === 'POST') {
-    const body = await readRequestBody(req);
-    const filename = body.filename || 'document.docx';
-    const ext = path.extname(filename).toLowerCase();
-    const typeMap = {
-      '.docx': 'document',
-      '.xlsx': 'spreadsheet',
-      '.pptx': 'presentation',
-      '.pdf': 'pdf',
-      '.md': 'markdown'
-    };
-    return sendJson(res, 200, {
-      status: 'success',
-      filename: filename,
-      parsed_type: typeMap[ext] || 'unknown',
-      size: body.content_base64 ? Math.round(body.content_base64.length * 0.75) : 0,
-      timestamp: new Date().toISOString()
-    });
+  // Everything else (including the SPA itself, /yjs REST, /r/:roomId, …)
+  // goes to Docs at the root, with the sidebar spliced into HTML responses.
+  req.__rewriteMode = 'docs-sidebar';
+  proxy.web(req, res, { target: DOCS_TARGET, selfHandleResponse: true });
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const url = req.url || '/';
+  if (url === '/chat' || url.startsWith('/chat/')) {
+    if (!isChatAuthed(req)) {
+      socket.destroy();
+      return;
+    }
+    req.url = stripPrefix(url, '/chat');
+    proxy.ws(req, socket, head, { target: CHAT_TARGET });
+    return;
   }
-
-  // Functional Endpoint: /api/apps
-  if (urlPath === '/api/apps' && req.method === 'GET') {
-    return sendJson(res, 200, {
-      apps: [
-        { id: 'shell', name: 'GenOffice Main Shell', status: 'active', path: '/' },
-        { id: 'docs', name: 'GenOffice Docs', status: 'active', path: '/docs/' },
-        { id: 'sheets', name: 'GenOffice Sheets', status: 'active', path: '/sheets/' },
-        { id: 'slides', name: 'GenOffice Slides', status: 'active', path: '/slides/' },
-        { id: 'pdf', name: 'GenOffice PDF', status: 'active', path: '/pdf/' },
-        { id: 'markdown', name: 'GenOffice Markdown', status: 'active', path: '/markdown/' },
-      ]
-    });
+  if (url === '/slides' || url.startsWith('/slides/')) {
+    req.url = stripPrefix(url, '/slides');
+    proxy.ws(req, socket, head, { target: SLIDES_TARGET });
+    return;
   }
-
-  // Root landing page: the shell's renderer bundle is an Electron app that
-  // depends on preload-only bridges (window.aiOffice, window.desktop, ...)
-  // which don't exist in a plain browser tab, so serving it directly here
-  // renders a blank white screen. Serve an informational page instead.
-  if (urlPath === '/') {
-    return serveStaticFile(req, res, path.join(__dirname, 'hf-space', 'landing.html'));
-  }
-
-  // Static Frontend Routing
-  let targetApp = 'shell';
-  let relativePath = urlPath;
-
-  if (urlPath.startsWith('/docs')) {
-    targetApp = 'docs';
-    relativePath = urlPath.substring('/docs'.length) || '/';
-  } else if (urlPath.startsWith('/sheets')) {
-    targetApp = 'sheets';
-    relativePath = urlPath.substring('/sheets'.length) || '/';
-  } else if (urlPath.startsWith('/slides')) {
-    targetApp = 'slides';
-    relativePath = urlPath.substring('/slides'.length) || '/';
-  } else if (urlPath.startsWith('/pdf')) {
-    targetApp = 'pdf';
-    relativePath = urlPath.substring('/pdf'.length) || '/';
-  } else if (urlPath.startsWith('/markdown')) {
-    targetApp = 'markdown';
-    relativePath = urlPath.substring('/markdown'.length) || '/';
-  }
-
-  if (relativePath === '' || relativePath === '/') {
-    relativePath = '/index.html';
-  }
-
-  const staticFilePath = path.join(__dirname, 'apps', targetApp, 'out', 'renderer', relativePath);
-
-  if (fs.existsSync(staticFilePath) && fs.statSync(staticFilePath).isFile()) {
-    return serveStaticFile(req, res, staticFilePath);
-  }
-
-  // Fallback to index.html for SPA client-side routing
-  const fallbackIndex = path.join(__dirname, 'apps', targetApp, 'out', 'renderer', 'index.html');
-  if (fs.existsSync(fallbackIndex)) {
-    return serveStaticFile(req, res, fallbackIndex);
-  }
-
-  // Global index fallback
-  res.writeHead(200, { 'Content-Type': 'text/html; charset=UTF-8' });
-  res.end(`<!DOCTYPE html><html><head><title>OpenUI Cowork</title></head><body><h1>OpenUI Cowork</h1><p>Welcome to OpenUI Cowork. Visit <a href="/api-docs">/api-docs</a> for API documentation or <a href="/health">/health</a> for system status.</p></body></html>`);
+  // Docs' own /yjs collab socket, at the root.
+  proxy.ws(req, socket, head, { target: DOCS_TARGET });
 });
 
 server.listen(PORT, () => {
-  console.log(`OpenUI Cowork server listening on port ${PORT}`);
+  console.log(`OpenUI Cowork proxy listening on ${PORT}`);
+});
+
+process.on('SIGTERM', () => {
+  for (const { child } of children) child.kill('SIGTERM');
+  process.exit(0);
 });
