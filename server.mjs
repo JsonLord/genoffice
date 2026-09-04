@@ -273,6 +273,14 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
+  // Root landing page: the shell's renderer bundle is an Electron app that
+  // depends on preload-only bridges (window.aiOffice, window.desktop, ...)
+  // which don't exist in a plain browser tab, so serving it directly here
+  // renders a blank white screen. Serve an informational page instead.
+  if (urlPath === '/') {
+    return serveStaticFile(req, res, path.join(__dirname, 'hf-space', 'landing.html'));
+  }
+
   // Static Frontend Routing
   let targetApp = 'shell';
   let relativePath = urlPath;
