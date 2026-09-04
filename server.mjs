@@ -9,16 +9,26 @@ const PORT = Number(process.env.PORT || 7860);
 // OpenCode is a coding agent with shell/file tool access in this container.
 // Its own server has no auth by default (OPENCODE_SERVER_PASSWORD unset —
 // it's only ever reached through this proxy, never exposed directly), so
-// this process gates every /chat request itself with a random code, printed
-// once to the container's stdout logs (visible to the Space owner under the
-// "Logs" tab, never to visitors) rather than baked into the image or shipped
-// to the browser.
-const CHAT_ACCESS_CODE = crypto.randomBytes(9).toString('base64url');
+// this process gates every /chat request itself with a code.
+//
+// Prefer a CHAT_ACCESS_CODE Space secret if one is set, so the code is
+// stable across restarts — HF Spaces sleep after idle and redeploy on every
+// push, and each restart used to mint a brand-new random code with no
+// signal to the owner, silently invalidating whatever code they'd copied
+// from an earlier log. Falls back to a random one (freshly printed to
+// stdout every boot) when no secret is set.
+const CHAT_ACCESS_CODE = process.env.CHAT_ACCESS_CODE || crypto.randomBytes(9).toString('base64url');
 const CHAT_COOKIE = 'oc_auth';
 
 console.log('════════════════════════════════════════════════════════════');
-console.log(' OpenCode chat access code (enter this in the chat sidebar):');
+console.log(' OpenCode chat/API access code:');
 console.log(' ' + CHAT_ACCESS_CODE);
+if (process.env.CHAT_ACCESS_CODE) {
+  console.log(' (from the CHAT_ACCESS_CODE secret — stable across restarts)');
+} else {
+  console.log(' (random — regenerates on every restart; set a CHAT_ACCESS_CODE');
+  console.log(' Space secret to pick your own and stop it from changing)');
+}
 console.log('════════════════════════════════════════════════════════════');
 
 // ─── Child processes ──────────────────────────────────────────────────────
@@ -174,7 +184,7 @@ function isChatAuthed(req) {
 function isApiAuthed(req) {
   const auth = req.headers.authorization || '';
   const bearer = auth.match(/^Bearer\s+(.+)$/i);
-  return !!bearer && bearer[1] === CHAT_ACCESS_CODE;
+  return !!bearer && bearer[1].trim() === CHAT_ACCESS_CODE;
 }
 
 function chatGateHtml(error) {
@@ -183,7 +193,7 @@ function chatGateHtml(error) {
 .box{max-width:280px;text-align:center}input{width:100%;padding:8px;margin:12px 0;border-radius:6px;border:1px solid #333;background:#111827;color:#fff;box-sizing:border-box}
 button{width:100%;padding:8px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}
 .err{color:#f87171;font-size:12px}</style></head>
-<body><div class="box"><p>Enter the access code from the Space owner's container logs.</p>
+<body><div class="box"><p>Enter the access code from the Space's <em>current</em> container logs (a restart mints a new one unless a CHAT_ACCESS_CODE secret is set).</p>
 <form method="POST" action="/chat-auth">
 <input name="code" autofocus placeholder="access code" autocomplete="off">
 <button type="submit">Unlock</button>
@@ -228,7 +238,7 @@ const server = http.createServer((req, res) => {
     req.on('data', (c) => (body += c));
     req.on('end', () => {
       const params = new URLSearchParams(body);
-      const code = params.get('code') || '';
+      const code = (params.get('code') || '').trim();
       if (code === CHAT_ACCESS_CODE) {
         res.writeHead(302, {
           'Set-Cookie': `${CHAT_COOKIE}=${encodeURIComponent(code)}; Path=/; HttpOnly; SameSite=Lax`,
