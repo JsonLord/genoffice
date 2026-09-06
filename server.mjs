@@ -192,12 +192,13 @@ function chatGateHtml(error) {
 <style>body{font:14px system-ui,sans-serif;background:#0b0d12;color:#e5e7eb;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
 .box{max-width:280px;text-align:center}input{width:100%;padding:8px;margin:12px 0;border-radius:6px;border:1px solid #333;background:#111827;color:#fff;box-sizing:border-box}
 button{width:100%;padding:8px;border-radius:6px;border:0;background:#2563eb;color:#fff;cursor:pointer}
-.err{color:#f87171;font-size:12px}</style></head>
-<body><div class="box"><p>Enter the access code from the Space's <em>current</em> container logs (a restart mints a new one unless a CHAT_ACCESS_CODE secret is set).</p>
+.err{color:#fff;background:#7f1d1d;border-radius:6px;padding:8px;font-size:13px;font-weight:600;margin-bottom:8px}</style></head>
+<body><div class="box">
+${error ? '<p class="err">✗ Incorrect code — that exact value was rejected.</p>' : ''}
+<p>Enter the access code from the Space's <em>current</em> container logs (a restart mints a new one unless a CHAT_ACCESS_CODE secret is set).</p>
 <form method="POST" action="/chat-auth">
-<input name="code" autofocus placeholder="access code" autocomplete="off">
+<input name="code" autofocus placeholder="access code" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
 <button type="submit">Unlock</button>
-${error ? '<p class="err">Incorrect code.</p>' : ''}
 </form></div></body></html>`;
 }
 
