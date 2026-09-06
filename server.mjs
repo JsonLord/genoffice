@@ -131,21 +131,22 @@ function injectSidebar(html) {
 }
 
 // OpenCode's UI bundle has no concept of being mounted under a subpath: its
-// HTML emits root-absolute asset tags (Vite's default `base: '/'`), and its
-// JS resolves its own API/WS base URL as `location.origin` (no path) unless
-// a `defaultServerUrl` override is sitting in localStorage before its entry
-// module runs. Both are fixed here rather than upstream: rewrite absolute
-// `src="/…"`/`href="/…"` tags to carry the `/chat` prefix our proxy expects,
-// and inject a pre-boot script that points the app's own API client back at
-// `/chat` (same trick self-hosted opencode.ai-style deployments would need).
+// HTML emits root-absolute asset tags (Vite's default `base: '/'`). Rewrite
+// them to carry the `/chat` prefix our proxy expects — the initial document
+// and its script/link tags are the one place OpenCode's own path handling
+// actually respects a prefix, since the browser fetches whatever literal
+// URL the tag names.
+//
+// Its *runtime* API/WS calls are a different story: they're always built as
+// `new URL(path, baseURL)` with a leading slash on `path`, which per the URL
+// spec discards any path segment in baseURL and resolves against the bare
+// origin — so no `defaultServerUrl` override in localStorage can make it
+// call `/chat/api/...` instead of `/api/...` (tried; it instead broke
+// OpenCode's own server-identity matching with an unrelated "Permission
+// server not found" error). classifyRootPath()'s routing is what actually
+// gets those calls to OpenCode correctly.
 function rewriteChatHtml(html) {
-  const withPrefixedAssets = html.replace(/((?:src|href)=")\/(?!\/)/g, '$1/chat/');
-  const bootScript =
-    '<script>try{localStorage.setItem("opencode.settings.dat:defaultServerUrl",location.origin+"/chat")}catch(e){}</script>';
-  const headIdx = withPrefixedAssets.indexOf('<head>');
-  if (headIdx === -1) return bootScript + withPrefixedAssets;
-  const insertAt = headIdx + '<head>'.length;
-  return withPrefixedAssets.slice(0, insertAt) + bootScript + withPrefixedAssets.slice(insertAt);
+  return html.replace(/((?:src|href)=")\/(?!\/)/g, '$1/chat/');
 }
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
@@ -185,6 +186,75 @@ function isApiAuthed(req) {
   const auth = req.headers.authorization || '';
   const bearer = auth.match(/^Bearer\s+(.+)$/i);
   return !!bearer && bearer[1].trim() === CHAT_ACCESS_CODE;
+}
+
+function isEitherAuthed(req) {
+  return isChatAuthed(req) || isApiAuthed(req);
+}
+
+// OpenCode's client always builds request URLs as `new URL(path, baseURL)`
+// with a leading slash on `path` — per the URL spec that discards ANY path
+// segment already in baseURL and resolves against the bare origin. No
+// localStorage/config override can make it call `/chat/api/...` instead of
+// `/api/...`. Its real surface turned out to be dozens of bare top-level
+// names with no shared prefix (/path, /vcs, /find, /log, /session, /project,
+// /provider, /pty, /question, /sync, /tui, /config, /permission, /mcp,
+// /global/*, /experimental/*, even /auth/:providerID) — an allowlist of
+// OpenCode's paths is a moving target. Docs' own surface is the opposite:
+// small, fixed, fully read from its source. So the default flips here:
+// anything NOT explicitly Docs' own goes to OpenCode at root (auth-checked
+// the same as /chat, since this bypasses that route entirely).
+const DOCS_EXACT_PATHS = new Set([
+  '/',
+  '/home',
+  '/embed',
+  '/yjs',
+  '/favicon.svg',
+  '/logo.svg',
+  '/og.png',
+  '/robots.txt',
+  '/sitemap.xml',
+  '/llms.txt',
+  '/404.html',
+  '/auth/signup',
+  '/auth/login',
+  '/auth/logout',
+  '/auth/me',
+  '/auth/status',
+  '/auth/change-password',
+  '/auth/delete-account',
+]);
+const DOCS_PREFIXES = [
+  '/document/',
+  '/r/',
+  '/assets/',
+  '/fonts/',
+  '/templates/',
+  '/api/rooms',
+  '/api/admin',
+  '/api/me',
+  '/api/files',
+  '/api/tokens',
+  '/api/mcp-proxy',
+  '/files/',
+  '/wopi/',
+  '/auth/profile',
+];
+// Demo/fixture files Docs serves at its root (e.g. sample .docx templates) —
+// caught by extension rather than by name, since the exact set can change
+// with the build.
+const DOCS_STATIC_EXTENSIONS = /\.(docx|svg|png|jpg|jpeg|ico|txt|xml|woff2?|css|js)$/i;
+
+function isDocsOwnPath(path) {
+  if (DOCS_EXACT_PATHS.has(path)) return true;
+  if (DOCS_PREFIXES.some((p) => path.startsWith(p))) return true;
+  if (DOCS_STATIC_EXTENSIONS.test(path)) return true;
+  return false;
+}
+
+function classifyRootPath(url) {
+  const path = url.split('?')[0];
+  return isDocsOwnPath(path) ? 'docs' : 'opencode';
 }
 
 function chatGateHtml(error) {
@@ -227,7 +297,7 @@ const server = http.createServer((req, res) => {
         '<ul><li><code>/</code> — Casual Docs (.docx editor)</li>' +
         '<li><code>/slides/</code> — Casual Slides (.pptx editor)</li>' +
         '<li><code>/chat/</code> — OpenCode AI chat (browser sidebar, cookie-gated by an access code)</li>' +
-        '<li><code>/api/</code> — same OpenCode backend for MCP/API clients — send <code>Authorization: Bearer &lt;access code&gt;</code></li></ul>' +
+        '<li><code>/mcp-api/</code> — same OpenCode backend for MCP/API clients — send <code>Authorization: Bearer &lt;access code&gt;</code></li></ul>' +
         '<p><code>/health</code> — liveness probe</p>' +
         '<p>The access code for both is printed to the container logs at startup.</p></body>',
     );
@@ -270,13 +340,19 @@ const server = http.createServer((req, res) => {
   // code as /chat, but header-authed instead of cookie-authed since a
   // non-browser client can't run the sidebar's login form. No HTML rewrite
   // here: this path is for JSON/API calls, not for rendering the chat UI.
-  if (url === '/api' || url.startsWith('/api/')) {
+  //
+  // Mounted at /mcp-api, NOT /api: OpenCode's own client hardcodes "/api" as
+  // its internal protocol-version probe path (GET /api/health) — reusing
+  // that prefix for this route intercepted OpenCode's own same-origin calls
+  // (which can't carry our bearer header) and 401'd the chat UI into an
+  // infinite retry loop.
+  if (url === '/mcp-api' || url.startsWith('/mcp-api/')) {
     if (!isApiAuthed(req)) {
       res.writeHead(401, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'missing or invalid Authorization: Bearer <access code>' }));
       return;
     }
-    req.url = stripPrefix(url, '/api');
+    req.url = stripPrefix(url, '/mcp-api');
     proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
     return;
   }
@@ -288,6 +364,18 @@ const server = http.createServer((req, res) => {
     // it per-listener AND leaving http-proxy's own default auto-pipe active
     // for routes that skip the flag would double-write the response).
     proxy.web(req, res, { target: SLIDES_TARGET, selfHandleResponse: true });
+    return;
+  }
+
+  // OpenCode's own root-absolute API calls (see classifyRootPath above) —
+  // gated the same as /chat since this bypasses that route entirely.
+  if (classifyRootPath(url) === 'opencode') {
+    if (!isEitherAuthed(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'not authenticated — unlock the chat sidebar first' }));
+      return;
+    }
+    proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
     return;
   }
 
@@ -308,18 +396,26 @@ server.on('upgrade', (req, socket, head) => {
     proxy.ws(req, socket, head, { target: CHAT_TARGET });
     return;
   }
-  if (url === '/api' || url.startsWith('/api/')) {
+  if (url === '/mcp-api' || url.startsWith('/mcp-api/')) {
     if (!isApiAuthed(req)) {
       socket.destroy();
       return;
     }
-    req.url = stripPrefix(url, '/api');
+    req.url = stripPrefix(url, '/mcp-api');
     proxy.ws(req, socket, head, { target: CHAT_TARGET });
     return;
   }
   if (url === '/slides' || url.startsWith('/slides/')) {
     req.url = stripPrefix(url, '/slides');
     proxy.ws(req, socket, head, { target: SLIDES_TARGET });
+    return;
+  }
+  if (classifyRootPath(url) === 'opencode') {
+    if (!isEitherAuthed(req)) {
+      socket.destroy();
+      return;
+    }
+    proxy.ws(req, socket, head, { target: CHAT_TARGET });
     return;
   }
   // Docs' own /yjs collab socket, at the root.
