@@ -145,8 +145,36 @@ function injectSidebar(html) {
 // OpenCode's own server-identity matching with an unrelated "Permission
 // server not found" error). classifyRootPath()'s routing is what actually
 // gets those calls to OpenCode correctly.
+// A prior version of this proxy briefly wrote a *wrong* override into this
+// same key (an earlier attempt at making OpenCode subpath-aware — reverted,
+// see the comment above rewriteChatHtml). Any browser that loaded /chat
+// during that window has the bad value stuck in localStorage indefinitely:
+// it survives page refreshes and even hard-refreshes, since those clear
+// cache/cookies but not localStorage. The app then keeps building its own
+// client-side "server" identity around that stale URL — visible in the
+// address bar as /server/<base64 of the stale URL>/session/... — and
+// requests silently go nowhere. Since we can't reach into a visitor's
+// browser to fix it, this scrubs the key back to unset (its correct,
+// working default) on every /chat load, self-healing anyone still carrying
+// the bad value forward without them needing to clear site data by hand.
+const CHAT_CLEANUP_SCRIPT_BODY =
+  'try{var k="opencode.settings.dat:defaultServerUrl";if(localStorage.getItem(k))localStorage.removeItem(k)}catch(e){}';
+const CHAT_CLEANUP_SCRIPT_HASH = crypto.createHash('sha256').update(CHAT_CLEANUP_SCRIPT_BODY).digest('base64');
+
 function rewriteChatHtml(html) {
-  return html.replace(/((?:src|href)=")\/(?!\/)/g, '$1/chat/');
+  const withPrefixedAssets = html.replace(/((?:src|href)=")\/(?!\/)/g, '$1/chat/');
+  const cleanupScript = `<script>${CHAT_CLEANUP_SCRIPT_BODY}</script>`;
+  const headIdx = withPrefixedAssets.indexOf('<head>');
+  if (headIdx === -1) return cleanupScript + withPrefixedAssets;
+  const insertAt = headIdx + '<head>'.length;
+  return withPrefixedAssets.slice(0, insertAt) + cleanupScript + withPrefixedAssets.slice(insertAt);
+}
+
+function allowCleanupScriptInCsp(csp) {
+  if (!csp) return csp;
+  const hashToken = `'sha256-${CHAT_CLEANUP_SCRIPT_HASH}'`;
+  if (csp.includes(hashToken)) return csp;
+  return csp.replace(/script-src([^;]*)/, (m, rest) => `script-src${rest} ${hashToken}`);
 }
 
 proxy.on('proxyRes', (proxyRes, req, res) => {
@@ -164,6 +192,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
     const rewritten = mode === 'docs-sidebar' ? injectSidebar(html) : rewriteChatHtml(html);
     const body = Buffer.from(rewritten, 'utf-8');
     const headers = { ...proxyRes.headers, 'content-length': Buffer.byteLength(body) };
+    if (mode === 'chat-subpath' && headers['content-security-policy']) {
+      headers['content-security-policy'] = allowCleanupScriptInCsp(headers['content-security-policy']);
+    }
     res.writeHead(proxyRes.statusCode, headers);
     res.end(body);
   });
