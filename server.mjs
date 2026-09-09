@@ -177,10 +177,27 @@ function allowCleanupScriptInCsp(csp) {
   return csp.replace(/script-src([^;]*)/, (m, rest) => `script-src${rest} ${hashToken}`);
 }
 
+// Beyond its HTML tags, OpenCode's own bundled JS carries several hardcoded
+// root-absolute asset paths — `new Worker("/assets/markdown.worker-*.js")`
+// for its markdown/syntax-highlighting worker, plus onboarding images and
+// icon sprites — that Vite emitted as plain string literals rather than
+// import.meta.url-relative references. Those never go through the HTML tag
+// rewrite above (they're not in a tag, they're inside already-loaded JS),
+// so at runtime the browser requests them at bare root, our proxy routes
+// bare /assets/* to Docs (Docs has its own /assets/ tree), and the request
+// 404s — which is exactly what silently broke the worker and produced the
+// "Js.onerror" crash reported for the deployed build. Rewrite the same way,
+// just scoped to JS files instead of HTML tags.
+function rewriteChatJs(js) {
+  return js.replace(/"\/assets\//g, '"/chat/assets/');
+}
+
 proxy.on('proxyRes', (proxyRes, req, res) => {
   const mode = req.__rewriteMode;
   const contentType = proxyRes.headers['content-type'] || '';
-  if (!mode || !contentType.includes('text/html')) {
+  const isHtml = contentType.includes('text/html');
+  const isChatJs = mode === 'chat-subpath' && /(?:java|ecma)script/i.test(contentType);
+  if (!mode || (!isHtml && !isChatJs)) {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
     return;
@@ -188,8 +205,9 @@ proxy.on('proxyRes', (proxyRes, req, res) => {
   const chunks = [];
   proxyRes.on('data', (c) => chunks.push(c));
   proxyRes.on('end', () => {
-    const html = Buffer.concat(chunks).toString('utf-8');
-    const rewritten = mode === 'docs-sidebar' ? injectSidebar(html) : rewriteChatHtml(html);
+    const text = Buffer.concat(chunks).toString('utf-8');
+    const rewritten =
+      mode === 'docs-sidebar' ? injectSidebar(text) : isChatJs ? rewriteChatJs(text) : rewriteChatHtml(text);
     const body = Buffer.from(rewritten, 'utf-8');
     const headers = { ...proxyRes.headers, 'content-length': Buffer.byteLength(body) };
     if (mode === 'chat-subpath' && headers['content-security-policy']) {
