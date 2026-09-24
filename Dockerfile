@@ -1,10 +1,12 @@
 # OpenUI Cowork — HF Space image
 #
 # Combines two independently-built, open-source web apps behind one
-# reverse proxy on a single port (HF Docker Spaces expose exactly one):
+# reverse proxy on a single port (HF Docker Spaces expose exactly one),
+# plus a small machine-readable /api/v1 surface (see api.mjs/server.mjs):
 #
 #   /            Casual Docs   (CasualOffice/docs)   — browser .docx editor
 #   /slides/*    Casual Slides (CasualOffice/slides)  — browser .pptx editor
+#   /api/v1/*    OpenUI Cowork's own machine API (workspaces, health, info)
 #
 # Neither app ships as an installable package we can `npm install`, so each
 # is built from source at a pinned commit (pins recorded in each git-pin RUN
@@ -21,7 +23,10 @@
 # version range, 1.14.51 through 1.18.32, independent of this proxy) where
 # sending a chat message races its own directory-resolution logic and gets
 # silently cancelled — "thinking" forever, no reply. Not fixable from here;
-# revisit if upstream fixes it.
+# revisit if upstream fixes it. Driving this deployment programmatically now
+# goes through the /api/v1 surface plus each app's own existing REST API
+# (e.g. Docs' /api/files, /api/rooms), rather than an embedded agent with
+# shell/file access inside the container.
 #
 # See server.mjs for the supervisor that spawns both child servers and
 # proxies / rewrites paths between them (neither app has native "mount under
@@ -110,10 +115,10 @@ RUN cp -a /build/slides/apps/web/dist/. /app/slides/apps/web/dist/
 WORKDIR /app/slides/apps/server
 RUN npm install --omit=dev
 
-# ── Supervisor / reverse proxy ───────────────────────────────────────────
+# ── Supervisor / reverse proxy / API ──────────────────────────────────────
 WORKDIR /app
 RUN npm install --no-save http-proxy@1.18.1
-COPY server.mjs ./
+COPY server.mjs api.mjs ./
 
 ENV PORT=7860
 EXPOSE 7860
