@@ -81,12 +81,15 @@ test('GET /openapi.json is unauthenticated and is a valid-shaped OpenAPI documen
     assert.ok(body.paths['/workspaces'])
     assert.ok(body.paths['/health'])
     assert.ok(body.paths['/workspaces/{workspace_id}/service'])
+    assert.ok(body.paths['/workspaces/{workspace_id}/documents'])
+    assert.ok(body.paths['/workspaces/{workspace_id}/documents/{document_id}'])
+    assert.ok(body.paths['/workspaces/{workspace_id}/documents/{document_id}/content'])
     const opIds = Object.values(body.paths)
       .flatMap((methods) => Object.values(methods))
       .map((op) => op.operationId)
     assert.deepEqual(new Set(opIds).size, opIds.length, 'operationIds must be unique')
     for (const id of opIds) {
-      assert.match(id, /^[a-z]+\.[a-z]+$/, `operationId "${id}" should look like resource.action`)
+      assert.match(id, /^[a-z]+\.[a-z_]+$/, `operationId "${id}" should look like resource.action`)
     }
   } finally {
     await close(server)
@@ -155,7 +158,7 @@ test('GET /api/v1/workspaces/{id} 404s on an unknown ID with a structured error'
   }
 })
 
-test('GET /api/v1/workspaces/{id}/service returns factual, unaudited-by-default metadata', async () => {
+test('GET /api/v1/workspaces/{id}/service reports docs as audited and slides as not yet', async () => {
   const server = await makeServer()
   try {
     const docs = await request(server, '/api/v1/workspaces/docs/service', { token: TOKEN })
@@ -165,8 +168,12 @@ test('GET /api/v1/workspaces/{id}/service returns factual, unaudited-by-default 
       base_path: '/',
       api_base: '/api',
       openapi: null,
-      capabilities: [],
+      capabilities: ['documents.create', 'documents.get', 'documents.read_content'],
     })
+    assert.ok(
+      !docs.body.capabilities.some((c) => c.includes('write')),
+      'no write capability is exposed — see docsAdapter.mjs for the upstream password-bypass gap',
+    )
 
     const slides = await request(server, '/api/v1/workspaces/slides/service', { token: TOKEN })
     assert.equal(slides.status, 200)

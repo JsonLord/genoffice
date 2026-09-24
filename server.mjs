@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import httpProxy from 'http-proxy'
 import { handleApiRequest } from './api.mjs'
 import { resolveApiAuth, FatalConfigError } from './config.mjs'
+import { createDocsAdapter } from './docsAdapter.mjs'
 
 const PORT = Number(process.env.PORT || 7860)
 
@@ -75,6 +76,12 @@ startChild('slides', 'npm', ['start'], {
 const DOCS_TARGET = { host: '127.0.0.1', port: 8080 }
 const SLIDES_TARGET = { host: '127.0.0.1', port: 3002 }
 
+// Adapter for the /api/v1 documents.* operations — talks to the same Docs
+// backend the proxy above forwards to, over plain HTTP rather than through
+// the proxy itself. See docsAdapter.mjs and docs/hf-space-docs-api-audit.md
+// for what's actually implemented and why.
+const docsAdapter = createDocsAdapter({ baseUrl: `http://${DOCS_TARGET.host}:${DOCS_TARGET.port}` })
+
 const proxy = httpProxy.createProxyServer({ ws: true })
 proxy.on('error', (err, req, res) => {
   console.error('proxy error:', err.message)
@@ -99,7 +106,7 @@ const server = http.createServer((req, res) => {
     return
   }
 
-  if (handleApiRequest(req, res, url, API_TOKEN)) {
+  if (handleApiRequest(req, res, url, API_TOKEN, { docsAdapter })) {
     return
   }
 

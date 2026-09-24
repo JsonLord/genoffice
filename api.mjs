@@ -21,10 +21,18 @@ export const API_VERSION = 'v1'
 // `nativeApiBase` records only what's already grounded in this proxy's own
 // routing: Docs' own backend serves a REST-ish surface under `/api` at its
 // mount (rooms, files, admin, me, tokens, mcp-proxy — all reachable through
-// this proxy already, unaudited beyond that). Slides' equivalent hasn't
-// been audited, so it stays `null` rather than a guess — see
-// `/api/v1/workspaces/{id}/service` and the README for how this fills in
-// over later passes.
+// this proxy already). Slides' equivalent hasn't been audited, so it stays
+// `null` rather than a guess.
+//
+// `documentCapabilities` is populated ONLY for what's actually been audited
+// and wired up to a real backend operation (docsAdapter.mjs) — see
+// docs/hf-space-docs-api-audit.md for the full audit against
+// collab@9b2a9a2d4928358efa0d298d14a601915df6a724 (the pinned commit this
+// deployment actually runs). Notably absent: any write capability — see
+// docsAdapter.mjs's module comment for the specific upstream gap that makes
+// "write a document's content" unsafe to advertise as a stable capability
+// today. Slides has not been audited in this pass (out of scope — see
+// project instructions), so it stays `[]`.
 export const WORKSPACES = [
   {
     id: 'docs',
@@ -33,6 +41,7 @@ export const WORKSPACES = [
     mount: '/',
     description: 'Browser .docx editor with real-time co-editing.',
     nativeApiBase: '/api',
+    documentCapabilities: ['documents.create', 'documents.get', 'documents.read_content'],
   },
   {
     id: 'slides',
@@ -41,11 +50,19 @@ export const WORKSPACES = [
     mount: '/slides',
     description: 'Browser .pptx editor.',
     nativeApiBase: null,
+    documentCapabilities: [],
   },
 ]
 
 export function findWorkspace(id) {
   return WORKSPACES.find((w) => w.id === id) || null
+}
+
+// Public `Workspace` DTO — only the fields declared in the OpenAPI schema.
+// WORKSPACES carries internal bookkeeping (nativeApiBase, documentCapabilities)
+// that belongs in toDiscoveryService/toServiceMetadata below, not here.
+function toPublicWorkspace(ws) {
+  return { id: ws.id, title: ws.title, kind: ws.kind, mount: ws.mount, description: ws.description }
 }
 
 // Discovery-document view of a workspace: how a client reaches the app
@@ -60,16 +77,19 @@ function toDiscoveryService(ws) {
 }
 
 // `/api/v1/workspaces/{id}/service` view: factual integration metadata
-// only. `openapi` and `capabilities` stay empty/null until that app's own
-// API has actually been audited in a later pass — see api.mjs's module
-// comment and the README's "Sub-service integration status" section.
+// only. `capabilities` lists only audited, wired-up operations (see
+// WORKSPACES' documentCapabilities above). `openapi` stays `null` for every
+// workspace: these operations are documented in THIS deployment's own
+// top-level /openapi.json (under /workspaces/{id}/documents...), not in a
+// separate per-app schema Docs or Slides publish themselves — neither app
+// generates its own OpenAPI document today (see the audit doc).
 function toServiceMetadata(ws) {
   return {
     id: ws.id,
     base_path: ws.mount,
     api_base: ws.nativeApiBase,
     openapi: null,
-    capabilities: [],
+    capabilities: ws.documentCapabilities,
   }
 }
 
@@ -226,6 +246,126 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      '/workspaces/{workspace_id}/documents': {
+        post: {
+          operationId: 'documents.create',
+          summary: 'Create a document in a workspace',
+          description:
+            'Currently implemented for the "docs" workspace only, backed by Casual Docs\' own ' +
+            'room creation. A document with a password can only be read back with that same ' +
+            'password (see documents.read_content) — see docs/hf-space-docs-api-audit.md for ' +
+            'why writing content is not yet exposed here.',
+          parameters: [
+            {
+              name: 'workspace_id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace ID. Only "docs" supports this operation today.',
+            },
+          ],
+          requestBody: {
+            required: false,
+            content: {
+              'application/json': {
+                schema: { $ref: '#/components/schemas/DocumentCreateRequest' },
+              },
+            },
+          },
+          responses: {
+            200: {
+              description: 'Document created',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Document' } },
+              },
+            },
+            401: { $ref: '#/components/responses/Unauthorized' },
+            404: { $ref: '#/components/responses/NotFound' },
+            503: { $ref: '#/components/responses/ApiErrorResponse' },
+          },
+        },
+      },
+      '/workspaces/{workspace_id}/documents/{document_id}': {
+        get: {
+          operationId: 'documents.get',
+          summary: "Get a document's metadata",
+          description: 'Currently implemented for the "docs" workspace only.',
+          parameters: [
+            {
+              name: 'workspace_id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace ID. Only "docs" supports this operation today.',
+            },
+            {
+              name: 'document_id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Document ID, as returned by documents.create.',
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Document metadata',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/Document' } },
+              },
+            },
+            401: { $ref: '#/components/responses/Unauthorized' },
+            404: { $ref: '#/components/responses/NotFound' },
+          },
+        },
+      },
+      '/workspaces/{workspace_id}/documents/{document_id}/content': {
+        get: {
+          operationId: 'documents.read_content',
+          summary: "Read a document's original content",
+          description:
+            "Returns the document's *original* uploaded content, not its live collaboratively-" +
+            "edited state — Casual Docs has no HTTP endpoint for a room's current content; live " +
+            'edits only exist as CRDT updates over its WebSocket. A document with edits since ' +
+            'creation will not reflect them here. Currently implemented for the "docs" workspace ' +
+            'only. See docs/hf-space-docs-api-audit.md.',
+          parameters: [
+            {
+              name: 'workspace_id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace ID. Only "docs" supports this operation today.',
+            },
+            {
+              name: 'document_id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Document ID, as returned by documents.create.',
+            },
+            {
+              name: 'password',
+              in: 'query',
+              required: false,
+              schema: { type: 'string' },
+              description:
+                'Required when documents.get reports needs_password: true for this document.',
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Document content bytes',
+              content: {
+                'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
+                  schema: { type: 'string', format: 'binary' },
+                },
+              },
+            },
+            401: { $ref: '#/components/responses/Unauthorized' },
+            404: { $ref: '#/components/responses/NotFound' },
+          },
+        },
+      },
     },
     components: {
       securitySchemes: {
@@ -311,6 +451,29 @@ export function buildOpenApiDocument() {
             },
           },
         },
+        DocumentCreateRequest: {
+          type: 'object',
+          properties: {
+            password: {
+              type: 'string',
+              description: 'Optional. If set, documents.read_content requires this same password.',
+            },
+          },
+        },
+        Document: {
+          type: 'object',
+          required: ['id', 'needs_password'],
+          properties: {
+            id: { type: 'string' },
+            needs_password: { type: 'boolean' },
+            has_initial_content: {
+              type: 'boolean',
+              description: 'Whether content has ever been uploaded for this document.',
+            },
+            has_snapshot: { type: 'boolean' },
+            active_clients: { type: 'integer' },
+          },
+        },
       },
       responses: {
         Unauthorized: {
@@ -321,16 +484,53 @@ export function buildOpenApiDocument() {
           description: 'Resource not found',
           content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
         },
+        ApiErrorResponse: {
+          description: 'Structured error',
+          content: { 'application/json': { schema: { $ref: '#/components/schemas/ApiError' } } },
+        },
       },
     },
   }
 }
 
+function readJsonBody(req) {
+  return new Promise((resolve) => {
+    let raw = ''
+    req.on('data', (chunk) => (raw += chunk))
+    req.on('end', () => {
+      if (!raw) return resolve({})
+      try {
+        resolve(JSON.parse(raw))
+      } catch {
+        resolve({})
+      }
+    })
+  })
+}
+
+// Maps a docsAdapter.mjs result (see its module comment) onto the HTTP
+// response. `mapOk` turns a successful result into the response body/status.
+function sendAdapterResult(res, result, mapOk) {
+  if (result.unavailable) {
+    apiError(res, 502, 'docs_unavailable', 'Could not reach the Docs backend.')
+    return
+  }
+  if (result.error) {
+    apiError(res, result.status, result.error.code, result.error.message)
+    return
+  }
+  mapOk(result)
+}
+
 // Handles /api/v1/*, /openapi.json and /.well-known/cws.json. Returns true
-// if it fully handled the request, false if the caller should fall through
-// to the app proxy routes. `token` is the expected bearer token, or `null`
-// to disable auth entirely (see checkBearerAuth).
-export function handleApiRequest(req, res, url, token) {
+// if it fully handled the request (synchronously, or asynchronously via a
+// promise this function does not await — the caller doesn't need to wait
+// for it), false if the caller should fall through to the app proxy
+// routes. `token` is the expected bearer token, or `null` to disable auth
+// entirely (see checkBearerAuth). `deps.docsAdapter` (docsAdapter.mjs) is
+// required for the "docs" workspace's documents.* operations; other
+// workspaces don't support them regardless of `deps`.
+export function handleApiRequest(req, res, url, token, deps = {}) {
   const path = url.split('?')[0]
 
   if (path === '/openapi.json') {
@@ -360,13 +560,13 @@ export function handleApiRequest(req, res, url, token) {
       service: 'cowork',
       api_version: API_VERSION,
       capabilities: ['workspaces'],
-      workspaces: WORKSPACES,
+      workspaces: WORKSPACES.map(toPublicWorkspace),
     })
     return true
   }
 
   if (path === '/api/v1/workspaces') {
-    apiJson(res, 200, { items: WORKSPACES, next_page_token: null })
+    apiJson(res, 200, { items: WORKSPACES.map(toPublicWorkspace), next_page_token: null })
     return true
   }
 
@@ -382,6 +582,115 @@ export function handleApiRequest(req, res, url, token) {
     return true
   }
 
+  const contentMatch = path.match(/^\/api\/v1\/workspaces\/([^/]+)\/documents\/([^/]+)\/content$/)
+  if (contentMatch) {
+    const [, workspaceId, documentId] = contentMatch.map(decodeURIComponent)
+    if (req.method !== 'GET') {
+      apiError(res, 405, 'method_not_allowed', 'Only GET is supported here.')
+      return true
+    }
+    const ws = findWorkspace(workspaceId)
+    if (!ws) {
+      apiError(res, 404, 'workspace_not_found', 'Workspace not found.', {
+        workspace_id: workspaceId,
+      })
+      return true
+    }
+    if (!ws.documentCapabilities.includes('documents.read_content') || !deps.docsAdapter) {
+      apiError(
+        res,
+        404,
+        'capability_not_available',
+        'documents.read_content is not implemented for this workspace.',
+        {
+          workspace_id: workspaceId,
+        },
+      )
+      return true
+    }
+    const password = new URL(url, 'http://internal').searchParams.get('password') || undefined
+    deps.docsAdapter
+      .getDocumentContent(documentId, { password })
+      .then((result) =>
+        sendAdapterResult(res, result, (ok) => {
+          res.writeHead(200, { 'Content-Type': ok.contentType || 'application/octet-stream' })
+          res.end(ok.buffer)
+        }),
+      )
+      .catch(() =>
+        apiError(res, 500, 'internal_error', 'Unexpected error reading document content.'),
+      )
+    return true
+  }
+
+  const documentMatch = path.match(/^\/api\/v1\/workspaces\/([^/]+)\/documents\/([^/]+)$/)
+  if (documentMatch) {
+    const [, workspaceId, documentId] = documentMatch.map(decodeURIComponent)
+    if (req.method !== 'GET') {
+      apiError(res, 405, 'method_not_allowed', 'Only GET is supported here.')
+      return true
+    }
+    const ws = findWorkspace(workspaceId)
+    if (!ws) {
+      apiError(res, 404, 'workspace_not_found', 'Workspace not found.', {
+        workspace_id: workspaceId,
+      })
+      return true
+    }
+    if (!ws.documentCapabilities.includes('documents.get') || !deps.docsAdapter) {
+      apiError(
+        res,
+        404,
+        'capability_not_available',
+        'documents.get is not implemented for this workspace.',
+        {
+          workspace_id: workspaceId,
+        },
+      )
+      return true
+    }
+    deps.docsAdapter
+      .getDocument(documentId)
+      .then((result) => sendAdapterResult(res, result, (ok) => apiJson(res, 200, ok.document)))
+      .catch(() =>
+        apiError(res, 500, 'internal_error', 'Unexpected error reading document metadata.'),
+      )
+    return true
+  }
+
+  const documentsMatch = path.match(/^\/api\/v1\/workspaces\/([^/]+)\/documents$/)
+  if (documentsMatch) {
+    const workspaceId = decodeURIComponent(documentsMatch[1])
+    if (req.method !== 'POST') {
+      apiError(res, 405, 'method_not_allowed', 'Only POST is supported here.')
+      return true
+    }
+    const ws = findWorkspace(workspaceId)
+    if (!ws) {
+      apiError(res, 404, 'workspace_not_found', 'Workspace not found.', {
+        workspace_id: workspaceId,
+      })
+      return true
+    }
+    if (!ws.documentCapabilities.includes('documents.create') || !deps.docsAdapter) {
+      apiError(
+        res,
+        404,
+        'capability_not_available',
+        'documents.create is not implemented for this workspace.',
+        {
+          workspace_id: workspaceId,
+        },
+      )
+      return true
+    }
+    readJsonBody(req)
+      .then((body) => deps.docsAdapter.createDocument({ password: body.password }))
+      .then((result) => sendAdapterResult(res, result, (ok) => apiJson(res, 200, ok.document)))
+      .catch(() => apiError(res, 500, 'internal_error', 'Unexpected error creating document.'))
+    return true
+  }
+
   const workspaceMatch = path.match(/^\/api\/v1\/workspaces\/([^/]+)$/)
   if (workspaceMatch) {
     const id = decodeURIComponent(workspaceMatch[1])
@@ -389,7 +698,7 @@ export function handleApiRequest(req, res, url, token) {
     if (!ws) {
       apiError(res, 404, 'workspace_not_found', 'Workspace not found.', { workspace_id: id })
     } else {
-      apiJson(res, 200, ws)
+      apiJson(res, 200, toPublicWorkspace(ws))
     }
     return true
   }

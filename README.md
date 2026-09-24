@@ -11,8 +11,9 @@ Two open-source web apps behind one reverse proxy, plus a small machine-readable
 - `/` — [Casual Docs](https://github.com/CasualOffice/docs), a browser `.docx` editor with real-time co-editing
 - `/slides/` — [Casual Slides](https://github.com/CasualOffice/slides), a browser `.pptx` editor
 - `/api/v1/*` — a stable, bearer-authenticated REST API over this deployment (workspaces, health,
-  info), described by `/openapi.json`, with a discovery document at `/.well-known/cws.json` for
-  machine clients such as the `cws` CLI
+  info, and an audited `documents.*` surface for the `docs` workspace), described by
+  `/openapi.json`, with a discovery document at `/.well-known/cws.json` for machine clients such
+  as the `cws` CLI
 
 Casual Sheets is intentionally not included in this deployment — it vendors a large forked
 rendering engine that needs its own separate build pass, which made the combined image too
@@ -53,12 +54,36 @@ curl -H "Authorization: Bearer $COWORK_API_TOKEN" https://<space-host>/api/v1/wo
 `/api/v1/workspaces` and `/.well-known/cws.json`'s `services` array both describe the apps mounted
 behind this proxy (currently `docs` and `slides`) as a registry — where each is mounted, and where
 its own native API lives, if known. `GET /api/v1/workspaces/{id}/service` returns that same
-integration metadata for one workspace. Neither Docs' nor Slides' own APIs have been audited yet,
-so `openapi` is `null` and `capabilities` is `[]` for both today; `api_base` for `docs` is `/api`
-(grounded in this proxy's own routing — Docs' backend already serves `/api/rooms`, `/api/files`,
-etc. there) and `null` for `slides` (not yet confirmed). Auditing each app's native API and
-publishing a real per-app OpenAPI contract are deliberately separate, later passes — this registry
-gives `cws` a stable place to look once that lands, without another change to the top-level schema.
+integration metadata for one workspace, including which capabilities have actually been audited
+and wired up:
+
+- **`docs`** — audited (see [`docs/hf-space-docs-api-audit.md`](docs/hf-space-docs-api-audit.md)).
+  `capabilities: ["documents.create", "documents.get", "documents.read_content"]`, backed by
+  Casual Docs' real room API through a thin typed adapter (`docsAdapter.mjs`). No write/delete
+  capability is exposed — the audit found that Docs' own room-content write routes skip the
+  password check their read routes enforce, so a "safe, stable" write claim wouldn't be true.
+- **`slides`** — not audited in this pass (out of scope here), `capabilities: []`.
+
+`api_base` for `docs` is `/api` (Docs' own native routes, still reachable directly through this
+proxy — e.g. `GET /api/rooms` — for anything not yet wrapped above) and `null` for `slides`.
+`openapi` is `null` for both: neither app publishes its own OpenAPI schema, and the `documents.*`
+operations above are documented in this deployment's own top-level `/openapi.json` instead.
+
+## Documents API (docs workspace)
+
+```bash
+# Create a document (room). Optional {"password": "..."} in the body.
+curl -X POST -H "Authorization: Bearer $COWORK_API_TOKEN" \
+  https://<space-host>/api/v1/workspaces/docs/documents
+
+# Get its metadata
+curl -H "Authorization: Bearer $COWORK_API_TOKEN" \
+  https://<space-host>/api/v1/workspaces/docs/documents/<id>
+
+# Read its original content (NOT live collaborative edits — see the audit doc)
+curl -H "Authorization: Bearer $COWORK_API_TOKEN" \
+  "https://<space-host>/api/v1/workspaces/docs/documents/<id>/content?password=<if set>"
+```
 
 ## Tests
 
@@ -82,5 +107,6 @@ resolve `workspaces.list` → call it with the bearer token → validate the JSO
 verifies discovery/openapi/health but skips the authenticated call.
 
 See `Dockerfile` and `server.mjs` for how the two apps are built (each from a pinned upstream
-commit) and proxied, `config.mjs` for the fail-closed auth decision, and `api.mjs` for the
-`/api/v1` implementation.
+commit) and proxied, `config.mjs` for the fail-closed auth decision, `api.mjs` for the `/api/v1`
+implementation, `docsAdapter.mjs` for the Docs documents.\* adapter, and
+[`docs/hf-space-docs-api-audit.md`](docs/hf-space-docs-api-audit.md) for the audit behind it.
