@@ -11,7 +11,7 @@ Two open-source web apps behind one reverse proxy, plus a small machine-readable
 - `/` — [Casual Docs](https://github.com/CasualOffice/docs), a browser `.docx` editor with real-time co-editing
 - `/slides/` — [Casual Slides](https://github.com/CasualOffice/slides), a browser `.pptx` editor
 - `/api/v1/*` — a stable, bearer-authenticated REST API over this deployment (workspaces, health,
-  info, and an audited `documents.*` surface for the `docs` workspace), described by
+  info, and an audited `documents_*` surface for the `docs` workspace), described by
   `/openapi.json`, with a discovery document at `/.well-known/cws.json` for machine clients such
   as the `cws` CLI
 
@@ -58,7 +58,7 @@ integration metadata for one workspace, including which capabilities have actual
 and wired up:
 
 - **`docs`** — audited (see [`docs/hf-space-docs-api-audit.md`](docs/hf-space-docs-api-audit.md)).
-  `capabilities: ["documents.create", "documents.get", "documents.read_content"]`, backed by
+  `capabilities: ["documents_create", "documents_get", "documents_download"]`, backed by
   Casual Docs' real room API through a thin typed adapter (`docsAdapter.mjs`). No write/delete
   capability is exposed — the audit found that Docs' own room-content write routes skip the
   password check their read routes enforce, so a "safe, stable" write claim wouldn't be true.
@@ -66,7 +66,7 @@ and wired up:
 
 `api_base` for `docs` is `/api` (Docs' own native routes, still reachable directly through this
 proxy — e.g. `GET /api/rooms` — for anything not yet wrapped above) and `null` for `slides`.
-`openapi` is `null` for both: neither app publishes its own OpenAPI schema, and the `documents.*`
+`openapi` is `null` for both: neither app publishes its own OpenAPI schema, and the `documents_*`
 operations above are documented in this deployment's own top-level `/openapi.json` instead.
 
 ## Documents API (docs workspace)
@@ -102,11 +102,58 @@ npm run test:hf-space-api-smoke
 ```
 
 It walks the same path a `cws`-style client would: `/.well-known/cws.json` → `/openapi.json` →
-resolve `workspaces.list` → call it with the bearer token → validate the JSON shape.
+resolve `workspaces_list` → call it with the bearer token → validate the JSON shape.
 `COWORK_SMOKE_TOKEN` is optional on top of `COWORK_SMOKE_BASE_URL`: without it, the test still
 verifies discovery/openapi/health but skips the authenticated call.
 
+## `cws` CLI compatibility
+
+This API's shape (operation IDs, path prefixes, pagination field name) is dictated by the actual
+adapter in [JsonLord/cli](https://github.com/JsonLord/cli)
+(`self-hosted-provider-adapter-...` branch's `src/openapi.rs`/`src/discovery.rs`/`src/executor.rs`),
+not by a hypothetical convention — verified by running a real compiled build of that CLI against a
+local instance of this API, not just by reading its source:
+
+- **Operation IDs are `resource_method`, one underscore, single-word method.** The adapter splits
+  an `operationId` on its _last_ underscore into `{resource}_{method}`; a multi-word method (e.g.
+  the earlier `documents.read_content` this project used before checking) gets silently absorbed
+  into the resource name instead of erroring. Every operationId here (`workspaces_list`,
+  `documents_download`, etc.) follows this — see `cws-compat.test.mjs`, which mirrors the exact
+  split algorithm and fails if a future change would break `cws`'s command generation.
+- **OpenAPI paths are absolute from root (`/api/v1/...`), not relative to `servers[].url`.** The
+  adapter combines a configured `base_url` with this document's paths but ignores `servers[].url`
+  whenever `base_url` is set — true for every self-hosted service, `cowork` included. A
+  `servers: [{url: "/api/v1"}]` + short-path document (this project's original shape) resolved to
+  `<base_url>/workspaces` instead of `<base_url>/api/v1/workspaces` — a live 404, confirmed against
+  a real build before this was fixed. `servers` here is `[{url: "/"}]` and every path carries the
+  `/api/v1` prefix explicitly.
+- **List responses paginate with camelCase `nextPageToken`** (Google Discovery convention, which
+  the executor's `--page-all` flag looks for verbatim), not `next_page_token`.
+- **Only `$ref`-based request/response schemas are captured** by the adapter — an inline schema is
+  silently dropped (no error, just no schema for `cws schema` to show). Every request/response body
+  in `api.mjs` is a named `$ref` for this reason.
+- **A real, blocking bug was found and fixed upstream, not worked around here:**
+  `fetch_discovery_document` tried its embedded fallback spec for the `cowork` service _before_
+  ever fetching the configured `schema_url` — since that fallback always "succeeds" (it's a
+  hardcoded constant), the live schema was dead code. Fixed in
+  [JsonLord/cli#3](https://github.com/JsonLord/cli/pull/3), which also updates
+  `tests/fixtures/cowork_openapi.json` to a verified snapshot of this API's real `/openapi.json`
+  instead of an old hypothetical shape.
+
+Quickstart once that fix is in place (the CLI's built-in `[services.cowork]` entry already points
+at this Space and reads its token from a `COWORK_TOKEN` env var — separate from this deployment's
+own `COWORK_API_TOKEN` secret, same value):
+
+```bash
+export COWORK_TOKEN=<the same value as this Space's COWORK_API_TOKEN secret>
+cws cowork workspaces list
+cws cowork workspaces get --params '{"workspace_id":"docs"}'
+cws cowork documents create --params '{"workspace_id":"docs"}'
+cws cowork documents download --params '{"workspace_id":"docs","document_id":"<id>"}'
+cws schema cowork.workspaces.list
+```
+
 See `Dockerfile` and `server.mjs` for how the two apps are built (each from a pinned upstream
 commit) and proxied, `config.mjs` for the fail-closed auth decision, `api.mjs` for the `/api/v1`
-implementation, `docsAdapter.mjs` for the Docs documents.\* adapter, and
+implementation, `docsAdapter.mjs` for the Docs documents\_\* adapter, and
 [`docs/hf-space-docs-api-audit.md`](docs/hf-space-docs-api-audit.md) for the audit behind it.

@@ -164,7 +164,7 @@ test('cws-style walk: create -> get -> read content for the docs workspace', asy
   }
 })
 
-test('documents.create requires our own bearer auth (Docs backend never sees an unauthed caller)', async () => {
+test('documents_create requires our own bearer auth (Docs backend never sees an unauthed caller)', async () => {
   const fakeDocs = await startFakeDocs()
   const gateway = await makeGateway(createDocsAdapter({ baseUrl: fakeDocs.baseUrl }))
   try {
@@ -180,7 +180,7 @@ test('documents.create requires our own bearer auth (Docs backend never sees an 
   }
 })
 
-test('documents.get 404s document_not_found for an unknown id', async () => {
+test('documents_get 404s document_not_found for an unknown id', async () => {
   const fakeDocs = await startFakeDocs()
   const gateway = await makeGateway(createDocsAdapter({ baseUrl: fakeDocs.baseUrl }))
   try {
@@ -193,7 +193,7 @@ test('documents.get 404s document_not_found for an unknown id', async () => {
   }
 })
 
-test('documents.read_content requires the password on a protected document', async () => {
+test('documents_download requires the password on a protected document', async () => {
   const fakeDocs = await startFakeDocs()
   const gateway = await makeGateway(createDocsAdapter({ baseUrl: fakeDocs.baseUrl }))
   try {

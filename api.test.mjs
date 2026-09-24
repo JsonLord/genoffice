@@ -78,18 +78,22 @@ test('GET /openapi.json is unauthenticated and is a valid-shaped OpenAPI documen
     const { status, body } = await request(server, '/openapi.json')
     assert.equal(status, 200)
     assert.ok(body.openapi.startsWith('3.'))
-    assert.ok(body.paths['/workspaces'])
-    assert.ok(body.paths['/health'])
-    assert.ok(body.paths['/workspaces/{workspace_id}/service'])
-    assert.ok(body.paths['/workspaces/{workspace_id}/documents'])
-    assert.ok(body.paths['/workspaces/{workspace_id}/documents/{document_id}'])
-    assert.ok(body.paths['/workspaces/{workspace_id}/documents/{document_id}/content'])
+    assert.ok(body.paths['/api/v1/workspaces'])
+    assert.ok(body.paths['/api/v1/health'])
+    assert.ok(body.paths['/api/v1/workspaces/{workspace_id}/service'])
+    assert.ok(body.paths['/api/v1/workspaces/{workspace_id}/documents'])
+    assert.ok(body.paths['/api/v1/workspaces/{workspace_id}/documents/{document_id}'])
+    assert.ok(body.paths['/api/v1/workspaces/{workspace_id}/documents/{document_id}/content'])
     const opIds = Object.values(body.paths)
       .flatMap((methods) => Object.values(methods))
       .map((op) => op.operationId)
     assert.deepEqual(new Set(opIds).size, opIds.length, 'operationIds must be unique')
     for (const id of opIds) {
-      assert.match(id, /^[a-z]+\.[a-z_]+$/, `operationId "${id}" should look like resource.action`)
+      // Must be resource_method with a SINGLE underscore boundary and a
+      // one-word method — see cws-compat.test.mjs for why (the real cws
+      // adapter splits on the LAST underscore; a multi-word method would
+      // get silently absorbed into the resource name).
+      assert.match(id, /^[a-z]+_[a-z]+$/, `operationId "${id}" should look like resource_method`)
     }
   } finally {
     await close(server)
@@ -126,7 +130,7 @@ test('GET /api/v1/workspaces lists workspaces with a valid token', async () => {
     assert.ok(Array.isArray(body.items))
     assert.ok(body.items.some((w) => w.id === 'docs'))
     assert.ok(body.items.some((w) => w.id === 'slides'))
-    assert.equal(body.next_page_token, null)
+    assert.equal(body.nextPageToken, null)
   } finally {
     await close(server)
   }
@@ -168,7 +172,7 @@ test('GET /api/v1/workspaces/{id}/service reports docs as audited and slides as 
       base_path: '/',
       api_base: '/api',
       openapi: null,
-      capabilities: ['documents.create', 'documents.get', 'documents.read_content'],
+      capabilities: ['documents_create', 'documents_get', 'documents_download'],
     })
     assert.ok(
       !docs.body.capabilities.some((c) => c.includes('write')),
@@ -222,7 +226,7 @@ test('GET /api/v1/info requires auth and reports capabilities', async () => {
     const { status, body } = await request(server, '/api/v1/info', { token: TOKEN })
     assert.equal(status, 200)
     assert.equal(body.api_version, 'v1')
-    assert.deepEqual(body.capabilities, ['workspaces'])
+    assert.deepEqual(body.capabilities, ['workspaces', 'documents'])
   } finally {
     await close(server)
   }
@@ -266,8 +270,8 @@ test('integration: discovery -> schema -> operation -> call', async () => {
     const schema = await request(server, discovery.body.schema)
     assert.equal(schema.status, 200)
 
-    const op = schema.body.paths['/workspaces'].get
-    assert.equal(op.operationId, 'workspaces.list')
+    const op = schema.body.paths['/api/v1/workspaces'].get
+    assert.equal(op.operationId, 'workspaces_list')
 
     const call = await request(server, `${discovery.body.base_url}/workspaces`, { token: TOKEN })
     assert.equal(call.status, 200)
