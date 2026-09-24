@@ -113,7 +113,7 @@ const SIDEBAR_HTML = `
     <span>Loading chat…</span>
     <a href="/chat/" target="_blank" rel="noopener" style="display:none;color:#60a5fa;">Taking a while — open chat in a new tab</a>
   </div>
-  <iframe id="__oc_iframe" src="/chat/" style="border:0;width:100%;height:calc(100% - 34px);background:#fff;display:none;"></iframe>
+  <iframe id="__oc_iframe" src="/chat/" style="border:0;width:100%;height:calc(100% - 34px);background:#fff;"></iframe>
 </div>
 <script>
 (function () {
@@ -125,6 +125,11 @@ const SIDEBAR_HTML = `
   var fallbackLink = status.querySelector('a');
   var loaded = false;
   var opened = false;
+  function markLoaded() {
+    if (loaded) return;
+    loaded = true;
+    status.style.display = 'none';
+  }
   function open() {
     panel.style.right = '0';
     if (!opened) {
@@ -135,15 +140,19 @@ const SIDEBAR_HTML = `
     }
   }
   function shut() { panel.style.right = '-420px'; }
-  iframe.addEventListener('load', function () {
-    loaded = true;
-    status.style.display = 'none';
-    iframe.style.display = 'block';
-  });
+  iframe.addEventListener('load', markLoaded);
   iframe.addEventListener('error', function () {
     status.querySelector('span').textContent = 'Chat failed to load.';
     fallbackLink.style.display = 'inline';
   });
+  // The iframe starts navigating as soon as its src attribute is parsed —
+  // before this script runs and attaches the 'load' listener above — so a
+  // fast-loading document (the gate page is ~1KB) can finish and fire 'load'
+  // before anyone is listening, leaving the status overlay stuck forever.
+  // Same-origin, so contentDocument is readable: catch that race directly.
+  try {
+    if (iframe.contentDocument && iframe.contentDocument.readyState === 'complete') markLoaded();
+  } catch (e) {}
   tab.addEventListener('click', open);
   close.addEventListener('click', shut);
 })();
@@ -353,6 +362,37 @@ function stripPrefix(url, prefix) {
   return null;
 }
 
+// OpenCode's own client sends a `directory` / `location[directory]` query
+// param on several endpoints (/session, /session/status, /api/reference)
+// that, reproduced locally against the exact same bundle build, is garbled
+// — a control byte followed by a UTF-8 replacement character — regardless
+// of the actual project directory or working-directory name. Most of those
+// endpoints tolerate it and return 200 anyway, but /api/reference 500s on
+// it, and that error appears to cascade into aborting the in-flight
+// send-message request (the same "one failure kills unrelated pending
+// requests" pattern behind the earlier markdown-worker crash) — the
+// concrete cause of a message showing "thinking" and then never producing
+// a reply. This is an upstream OpenCode bug, not something wrong with our
+// proxying, so patch it at the edge: drop a garbled directory param before
+// forwarding and let OpenCode fall back to its own default.
+function sanitizeDirectoryQuery(url) {
+  const qIdx = url.indexOf('?');
+  if (qIdx === -1) return url;
+  const path = url.slice(0, qIdx);
+  const params = new URLSearchParams(url.slice(qIdx + 1));
+  let changed = false;
+  for (const key of ['directory', 'location[directory]']) {
+    const val = params.get(key);
+    if (val && /[\u0000-\u001f�]/.test(val)) {
+      params.delete(key);
+      changed = true;
+    }
+  }
+  if (!changed) return url;
+  const qs = params.toString();
+  return qs ? `${path}?${qs}` : path;
+}
+
 const server = http.createServer((req, res) => {
   const url = req.url || '/';
 
@@ -405,7 +445,7 @@ const server = http.createServer((req, res) => {
       res.end(chatGateHtml(false));
       return;
     }
-    req.url = stripPrefix(url, '/chat');
+    req.url = sanitizeDirectoryQuery(stripPrefix(url, '/chat'));
     req.__rewriteMode = 'chat-subpath';
     proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
     return;
@@ -427,7 +467,7 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'missing or invalid Authorization: Bearer <access code>' }));
       return;
     }
-    req.url = stripPrefix(url, '/mcp-api');
+    req.url = sanitizeDirectoryQuery(stripPrefix(url, '/mcp-api'));
     proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
     return;
   }
@@ -450,6 +490,7 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'not authenticated — unlock the chat sidebar first' }));
       return;
     }
+    req.url = sanitizeDirectoryQuery(url);
     proxy.web(req, res, { target: CHAT_TARGET, selfHandleResponse: true });
     return;
   }
