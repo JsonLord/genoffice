@@ -1,26 +1,30 @@
 # OpenUI Cowork — HF Space image
 #
-# Combines three independently-built, open-source web apps behind one
+# Combines two independently-built, open-source web apps behind one
 # reverse proxy on a single port (HF Docker Spaces expose exactly one):
 #
 #   /            Casual Docs   (CasualOffice/docs)   — browser .docx editor
 #   /slides/*    Casual Slides (CasualOffice/slides)  — browser .pptx editor
-#   /chat/*      OpenCode      (sst/opencode)         — AI coding-agent chat,
-#                                                        embedded as a sidebar
-#                                                        iframe on the Docs page
 #
-# None of these apps ship as installable packages we can `npm install`, so
-# each is built from source at a pinned commit (pins recorded in each git-pin
-# RUN step below — bump them deliberately, don't float to a branch tip).
+# Neither app ships as an installable package we can `npm install`, so each
+# is built from source at a pinned commit (pins recorded in each git-pin RUN
+# step below — bump them deliberately, don't float to a branch tip).
 #
 # Casual Sheets (CasualOffice/sheets) is deliberately NOT included here: it
 # vendors a ~50-package forked rendering engine that needs its own separate
 # build pass, documented upstream as OOM-prone even on dedicated CI runners.
-# Combined with Docs + Slides + OpenCode in one image it made this build too
+# Combined with Docs + Slides in one image it made this build too
 # heavy/fragile for the Space's current hardware tier.
 #
-# See server.mjs for the supervisor that spawns all child servers and proxies
-# / rewrites paths between them (none of these apps have native "mount under
+# An OpenCode (sst/opencode) AI chat sidebar was tried at /chat/ and removed:
+# its bundled client has an upstream bug (reproduced across the entire usable
+# version range, 1.14.51 through 1.18.32, independent of this proxy) where
+# sending a chat message races its own directory-resolution logic and gets
+# silently cancelled — "thinking" forever, no reply. Not fixable from here;
+# revisit if upstream fixes it.
+#
+# See server.mjs for the supervisor that spawns both child servers and
+# proxies / rewrites paths between them (neither app has native "mount under
 # a subpath" support, so the proxy strips path prefixes before forwarding).
 
 FROM node:22
@@ -105,9 +109,6 @@ RUN cp -a /build/slides/apps/server/. /app/slides/apps/server/
 RUN cp -a /build/slides/apps/web/dist/. /app/slides/apps/web/dist/
 WORKDIR /app/slides/apps/server
 RUN npm install --omit=dev
-
-# ── OpenCode (AI coding-agent chat) ─────────────────────────────────────
-RUN npm install -g opencode-ai@1.18.27
 
 # ── Supervisor / reverse proxy ───────────────────────────────────────────
 WORKDIR /app
