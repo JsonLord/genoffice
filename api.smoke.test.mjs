@@ -33,9 +33,13 @@ test(
     const schemaRes = await fetch(new URL(discovery.schema, BASE_URL))
     assert.equal(schemaRes.status, 200)
     const schema = await schemaRes.json()
-    const listOp = schema.paths?.['/workspaces']?.get
-    assert.ok(listOp, 'workspaces.list operation should exist in the deployed schema')
-    assert.equal(listOp.operationId, 'workspaces.list')
+    // Paths are absolute from root (/api/v1/...), not relative to
+    // `servers[].url` — see the "cws CLI compatibility" section in
+    // README.md for why (the real cws adapter ignores servers[].url
+    // whenever a base_url override is configured, which it always is).
+    const listOp = schema.paths?.['/api/v1/workspaces']?.get
+    assert.ok(listOp, 'workspaces_list operation should exist in the deployed schema')
+    assert.equal(listOp.operationId, 'workspaces_list')
 
     const healthRes = await fetch(new URL('/api/v1/health', BASE_URL))
     assert.equal(healthRes.status, 200)
@@ -43,7 +47,7 @@ test(
     assert.equal(health.status, 'ok')
 
     await t.test(
-      'authenticated workspaces.list call',
+      'authenticated workspaces_list call',
       { skip: !TOKEN && 'set COWORK_SMOKE_TOKEN to also test the authenticated call' },
       async () => {
         const listUrl = new URL(discovery.base_url + '/workspaces', BASE_URL)
