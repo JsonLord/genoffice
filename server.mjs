@@ -109,15 +109,41 @@ const SIDEBAR_HTML = `
     <span>OpenCode</span>
     <span id="__oc_close" style="cursor:pointer;opacity:.7;padding:2px 6px;">✕</span>
   </div>
-  <iframe id="__oc_iframe" src="/chat/" style="border:0;width:100%;height:calc(100% - 34px);background:#fff;"></iframe>
+  <div id="__oc_status" style="position:absolute;top:34px;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;color:#9ca3af;font:13px system-ui,sans-serif;text-align:center;padding:24px;box-sizing:border-box;background:#0b0d12;">
+    <span>Loading chat…</span>
+    <a href="/chat/" target="_blank" rel="noopener" style="display:none;color:#60a5fa;">Taking a while — open chat in a new tab</a>
+  </div>
+  <iframe id="__oc_iframe" src="/chat/" style="border:0;width:100%;height:calc(100% - 34px);background:#fff;display:none;"></iframe>
 </div>
 <script>
 (function () {
   var tab = document.getElementById('__oc_tab');
   var panel = document.getElementById('__oc_panel');
   var close = document.getElementById('__oc_close');
-  function open() { panel.style.right = '0'; }
+  var iframe = document.getElementById('__oc_iframe');
+  var status = document.getElementById('__oc_status');
+  var fallbackLink = status.querySelector('a');
+  var loaded = false;
+  var opened = false;
+  function open() {
+    panel.style.right = '0';
+    if (!opened) {
+      opened = true;
+      setTimeout(function () {
+        if (!loaded) fallbackLink.style.display = 'inline';
+      }, 4000);
+    }
+  }
   function shut() { panel.style.right = '-420px'; }
+  iframe.addEventListener('load', function () {
+    loaded = true;
+    status.style.display = 'none';
+    iframe.style.display = 'block';
+  });
+  iframe.addEventListener('error', function () {
+    status.querySelector('span').textContent = 'Chat failed to load.';
+    fallbackLink.style.display = 'inline';
+  });
   tab.addEventListener('click', open);
   close.addEventListener('click', shut);
 })();
