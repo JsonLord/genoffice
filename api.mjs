@@ -33,6 +33,14 @@ export const API_VERSION = 'v1'
 // "write a document's content" unsafe to advertise as a stable capability
 // today. Slides has not been audited in this pass (out of scope — see
 // project instructions), so it stays `[]`.
+//
+// Capability strings use the same `resource_method` spelling as the
+// matching OpenAPI `operationId` (see buildOpenApiDocument) — e.g.
+// "documents_get" here always means the `documents_get` operation — so a
+// `cws` client can go from one to the other without a lookup table. That
+// convention is dictated by the actual `cws` OpenAPI adapter (it splits an
+// operationId on its LAST underscore into resource + single-word method;
+// see the `cws` compatibility notes in api.test.mjs), not chosen freely.
 export const WORKSPACES = [
   {
     id: 'docs',
@@ -41,7 +49,7 @@ export const WORKSPACES = [
     mount: '/',
     description: 'Browser .docx editor with real-time co-editing.',
     nativeApiBase: '/api',
-    documentCapabilities: ['documents.create', 'documents.get', 'documents.read_content'],
+    documentCapabilities: ['documents_create', 'documents_get', 'documents_download'],
   },
   {
     id: 'slides',
@@ -52,6 +60,15 @@ export const WORKSPACES = [
     nativeApiBase: null,
     documentCapabilities: [],
   },
+]
+
+// Top-level capabilities this deployment's OWN /api/v1 implements (as
+// opposed to a workspace's documentCapabilities, which describe what's
+// wired up for that specific app). Derived, not hand-maintained, so it
+// can't drift from WORKSPACES.
+const CAPABILITIES = [
+  'workspaces',
+  ...(WORKSPACES.some((w) => w.documentCapabilities.length > 0) ? ['documents'] : []),
 ]
 
 export function findWorkspace(id) {
@@ -123,11 +140,25 @@ export function buildDiscoveryDocument() {
     schema: '/openapi.json',
     schema_type: 'openapi',
     auth: { type: 'bearer' },
-    capabilities: ['workspaces'],
+    capabilities: CAPABILITIES,
     services: WORKSPACES.map(toDiscoveryService),
   }
 }
 
+// Path keys below are given in FULL from root (`/api/v1/...`), not
+// relative to a `servers[].url` prefix, even though OpenAPI would normally
+// let `servers: [{ url: '/api/v1' }]` carry that prefix. This is dictated
+// by the real `cws` OpenAPI adapter (JsonLord/cli, src/discovery.rs
+// build_url / src/openapi.rs convert_openapi_to_rest_description): when a
+// service has a configured `base_url` — true for every self-hosted service,
+// including the built-in "cowork" entry — the adapter uses that base_url
+// verbatim as the request root and ignores this document's `servers[].url`
+// entirely. A `servers: [{ url: '/api/v1' }]` + short paths document (this
+// project's previous shape) resolved to `<base_url>/workspaces` instead of
+// `<base_url>/api/v1/workspaces` — a live 404 confirmed against a real
+// compiled `cws` build. `servers: [{ url: '/' }]` here is accurate (this
+// API really is served from the deployment root) and paths carry the
+// `/api/v1` prefix explicitly so the resolved URL is correct regardless.
 export function buildOpenApiDocument() {
   return {
     openapi: '3.1.0',
@@ -139,12 +170,12 @@ export function buildOpenApiDocument() {
         'and service liveness. Each app also exposes its own native REST surface directly through this ' +
         'proxy (see each workspace\'s "mount") for capabilities not yet unified here.',
     },
-    servers: [{ url: '/api/v1' }],
+    servers: [{ url: '/' }],
     security: [{ bearerAuth: [] }],
     paths: {
-      '/health': {
+      '/api/v1/health': {
         get: {
-          operationId: 'health.check',
+          operationId: 'health_check',
           summary: 'Liveness probe',
           description: 'Returns service status without touching any backend app. Unauthenticated.',
           security: [],
@@ -158,9 +189,9 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/info': {
+      '/api/v1/info': {
         get: {
-          operationId: 'info.get',
+          operationId: 'info_get',
           summary: 'Deployment metadata and capabilities',
           description:
             'Describes enabled capabilities and mounted workspaces. Requires authentication.',
@@ -173,9 +204,9 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/workspaces': {
+      '/api/v1/workspaces': {
         get: {
-          operationId: 'workspaces.list',
+          operationId: 'workspaces_list',
           summary: 'List workspaces',
           description:
             'Each workspace is one of the apps mounted behind this proxy (Casual Docs, Casual Slides).',
@@ -190,9 +221,9 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/workspaces/{workspace_id}': {
+      '/api/v1/workspaces/{workspace_id}': {
         get: {
-          operationId: 'workspaces.get',
+          operationId: 'workspaces_get',
           summary: 'Get a workspace by ID',
           parameters: [
             {
@@ -215,9 +246,9 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/workspaces/{workspace_id}/service': {
+      '/api/v1/workspaces/{workspace_id}/service': {
         get: {
-          operationId: 'workspaces.service',
+          operationId: 'workspaces_service',
           summary: "Get integration metadata for a workspace's underlying app",
           description:
             'Factual integration metadata for the app backing this workspace: where its own ' +
@@ -246,14 +277,14 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/workspaces/{workspace_id}/documents': {
+      '/api/v1/workspaces/{workspace_id}/documents': {
         post: {
-          operationId: 'documents.create',
+          operationId: 'documents_create',
           summary: 'Create a document in a workspace',
           description:
             'Currently implemented for the "docs" workspace only, backed by Casual Docs\' own ' +
             'room creation. A document with a password can only be read back with that same ' +
-            'password (see documents.read_content) — see docs/hf-space-docs-api-audit.md for ' +
+            'password (see documents_download) — see docs/hf-space-docs-api-audit.md for ' +
             'why writing content is not yet exposed here.',
           parameters: [
             {
@@ -285,9 +316,9 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/workspaces/{workspace_id}/documents/{document_id}': {
+      '/api/v1/workspaces/{workspace_id}/documents/{document_id}': {
         get: {
-          operationId: 'documents.get',
+          operationId: 'documents_get',
           summary: "Get a document's metadata",
           description: 'Currently implemented for the "docs" workspace only.',
           parameters: [
@@ -303,7 +334,7 @@ export function buildOpenApiDocument() {
               in: 'path',
               required: true,
               schema: { type: 'string' },
-              description: 'Document ID, as returned by documents.create.',
+              description: 'Document ID, as returned by documents_create.',
             },
           ],
           responses: {
@@ -318,10 +349,10 @@ export function buildOpenApiDocument() {
           },
         },
       },
-      '/workspaces/{workspace_id}/documents/{document_id}/content': {
+      '/api/v1/workspaces/{workspace_id}/documents/{document_id}/content': {
         get: {
-          operationId: 'documents.read_content',
-          summary: "Read a document's original content",
+          operationId: 'documents_download',
+          summary: "Download a document's original content",
           description:
             "Returns the document's *original* uploaded content, not its live collaboratively-" +
             "edited state — Casual Docs has no HTTP endpoint for a room's current content; live " +
@@ -341,7 +372,7 @@ export function buildOpenApiDocument() {
               in: 'path',
               required: true,
               schema: { type: 'string' },
-              description: 'Document ID, as returned by documents.create.',
+              description: 'Document ID, as returned by documents_create.',
             },
             {
               name: 'password',
@@ -349,7 +380,7 @@ export function buildOpenApiDocument() {
               required: false,
               schema: { type: 'string' },
               description:
-                'Required when documents.get reports needs_password: true for this document.',
+                'Required when documents_get reports needs_password: true for this document.',
             },
           ],
           responses: {
@@ -406,7 +437,7 @@ export function buildOpenApiDocument() {
           required: ['items'],
           properties: {
             items: { type: 'array', items: { $ref: '#/components/schemas/Workspace' } },
-            next_page_token: { type: 'string', nullable: true },
+            nextPageToken: { type: 'string', nullable: true },
           },
         },
         WorkspaceService: {
@@ -432,7 +463,7 @@ export function buildOpenApiDocument() {
               type: 'array',
               items: { type: 'string' },
               description:
-                'Audited, exposed capabilities of this app\'s native API, e.g. "files.read".',
+                'Audited, exposed capabilities of this app\'s native API, e.g. "documents_get".',
             },
           },
         },
@@ -456,7 +487,7 @@ export function buildOpenApiDocument() {
           properties: {
             password: {
               type: 'string',
-              description: 'Optional. If set, documents.read_content requires this same password.',
+              description: 'Optional. If set, documents_download requires this same password.',
             },
           },
         },
@@ -559,14 +590,14 @@ export function handleApiRequest(req, res, url, token, deps = {}) {
     apiJson(res, 200, {
       service: 'cowork',
       api_version: API_VERSION,
-      capabilities: ['workspaces'],
+      capabilities: CAPABILITIES,
       workspaces: WORKSPACES.map(toPublicWorkspace),
     })
     return true
   }
 
   if (path === '/api/v1/workspaces') {
-    apiJson(res, 200, { items: WORKSPACES.map(toPublicWorkspace), next_page_token: null })
+    apiJson(res, 200, { items: WORKSPACES.map(toPublicWorkspace), nextPageToken: null })
     return true
   }
 
@@ -596,12 +627,12 @@ export function handleApiRequest(req, res, url, token, deps = {}) {
       })
       return true
     }
-    if (!ws.documentCapabilities.includes('documents.read_content') || !deps.docsAdapter) {
+    if (!ws.documentCapabilities.includes('documents_download') || !deps.docsAdapter) {
       apiError(
         res,
         404,
         'capability_not_available',
-        'documents.read_content is not implemented for this workspace.',
+        'documents_download is not implemented for this workspace.',
         {
           workspace_id: workspaceId,
         },
@@ -637,12 +668,12 @@ export function handleApiRequest(req, res, url, token, deps = {}) {
       })
       return true
     }
-    if (!ws.documentCapabilities.includes('documents.get') || !deps.docsAdapter) {
+    if (!ws.documentCapabilities.includes('documents_get') || !deps.docsAdapter) {
       apiError(
         res,
         404,
         'capability_not_available',
-        'documents.get is not implemented for this workspace.',
+        'documents_get is not implemented for this workspace.',
         {
           workspace_id: workspaceId,
         },
@@ -672,12 +703,12 @@ export function handleApiRequest(req, res, url, token, deps = {}) {
       })
       return true
     }
-    if (!ws.documentCapabilities.includes('documents.create') || !deps.docsAdapter) {
+    if (!ws.documentCapabilities.includes('documents_create') || !deps.docsAdapter) {
       apiError(
         res,
         404,
         'capability_not_available',
-        'documents.create is not implemented for this workspace.',
+        'documents_create is not implemented for this workspace.',
         {
           workspace_id: workspaceId,
         },
