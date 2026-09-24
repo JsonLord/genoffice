@@ -1,8 +1,8 @@
 import http from 'node:http'
-import crypto from 'node:crypto'
 import { spawn } from 'node:child_process'
 import httpProxy from 'http-proxy'
 import { handleApiRequest } from './api.mjs'
+import { resolveApiAuth, FatalConfigError } from './config.mjs'
 
 const PORT = Number(process.env.PORT || 7860)
 
@@ -12,28 +12,35 @@ const PORT = Number(process.env.PORT || 7860)
 // gates the small, stable /api/v1 surface this proxy itself exposes for
 // machine clients (e.g. the `cws` CLI).
 //
-// Prefer a COWORK_API_TOKEN Space secret. If unset, generate a random token
-// and print it to the container logs (secure by default) so a deployed
-// Space is never open by accident. Set COWORK_API_AUTH_DISABLED=true to
-// explicitly turn auth off for local development only; never do this in a
-// deployed Space.
-const API_AUTH_DISABLED = process.env.COWORK_API_AUTH_DISABLED === 'true'
-const API_TOKEN = API_AUTH_DISABLED
-  ? null
-  : process.env.COWORK_API_TOKEN || crypto.randomBytes(24).toString('base64url')
+// resolveApiAuth (config.mjs) fails closed: in a deployed environment
+// (SPACE_ID set by HF, or COWORK_ENV=production), COWORK_API_TOKEN is
+// required and auth cannot be disabled — no auto-generated token, since one
+// is only as secret as the container logs it's printed to. Auto-generation
+// and COWORK_API_AUTH_DISABLED=true are dev-only conveniences.
+let apiAuth
+try {
+  apiAuth = resolveApiAuth(process.env)
+} catch (err) {
+  if (!(err instanceof FatalConfigError)) throw err
+  console.error('════════════════════════════════════════════════════════════')
+  console.error(' FATAL: ' + err.message)
+  console.error('════════════════════════════════════════════════════════════')
+  process.exit(1)
+}
+const API_TOKEN = apiAuth.token
 
 console.log('════════════════════════════════════════════════════════════')
-if (API_AUTH_DISABLED) {
+if (apiAuth.disabled) {
   console.log(' /api/v1 authentication is DISABLED (COWORK_API_AUTH_DISABLED=true)')
   console.log(' Do not set this in a deployed Space.')
 } else {
   console.log(' /api/v1 bearer token:')
   console.log(' ' + API_TOKEN)
-  if (process.env.COWORK_API_TOKEN) {
-    console.log(' (from the COWORK_API_TOKEN secret — stable across restarts)')
-  } else {
+  if (apiAuth.generated) {
     console.log(' (random — regenerates on every restart; set a COWORK_API_TOKEN')
     console.log(' Space secret to pick your own and stop it from changing)')
+  } else {
+    console.log(' (from the COWORK_API_TOKEN secret — stable across restarts)')
   }
 }
 console.log('════════════════════════════════════════════════════════════')

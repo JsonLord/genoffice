@@ -18,6 +18,13 @@
 
 export const API_VERSION = 'v1'
 
+// `nativeApiBase` records only what's already grounded in this proxy's own
+// routing: Docs' own backend serves a REST-ish surface under `/api` at its
+// mount (rooms, files, admin, me, tokens, mcp-proxy — all reachable through
+// this proxy already, unaudited beyond that). Slides' equivalent hasn't
+// been audited, so it stays `null` rather than a guess — see
+// `/api/v1/workspaces/{id}/service` and the README for how this fills in
+// over later passes.
 export const WORKSPACES = [
   {
     id: 'docs',
@@ -25,6 +32,7 @@ export const WORKSPACES = [
     kind: 'docx',
     mount: '/',
     description: 'Browser .docx editor with real-time co-editing.',
+    nativeApiBase: '/api',
   },
   {
     id: 'slides',
@@ -32,11 +40,37 @@ export const WORKSPACES = [
     kind: 'pptx',
     mount: '/slides',
     description: 'Browser .pptx editor.',
+    nativeApiBase: null,
   },
 ]
 
 export function findWorkspace(id) {
   return WORKSPACES.find((w) => w.id === id) || null
+}
+
+// Discovery-document view of a workspace: how a client reaches the app
+// itself, not how it authenticates or what it can do there.
+function toDiscoveryService(ws) {
+  return {
+    id: ws.id,
+    type: 'app',
+    base_url: ws.mount,
+    native_api: ws.nativeApiBase,
+  }
+}
+
+// `/api/v1/workspaces/{id}/service` view: factual integration metadata
+// only. `openapi` and `capabilities` stay empty/null until that app's own
+// API has actually been audited in a later pass — see api.mjs's module
+// comment and the README's "Sub-service integration status" section.
+function toServiceMetadata(ws) {
+  return {
+    id: ws.id,
+    base_path: ws.mount,
+    api_base: ws.nativeApiBase,
+    openapi: null,
+    capabilities: [],
+  }
 }
 
 export function apiError(res, status, code, message, details = {}) {
@@ -70,6 +104,7 @@ export function buildDiscoveryDocument() {
     schema_type: 'openapi',
     auth: { type: 'bearer' },
     capabilities: ['workspaces'],
+    services: WORKSPACES.map(toDiscoveryService),
   }
 }
 
@@ -160,6 +195,37 @@ export function buildOpenApiDocument() {
           },
         },
       },
+      '/workspaces/{workspace_id}/service': {
+        get: {
+          operationId: 'workspaces.service',
+          summary: "Get integration metadata for a workspace's underlying app",
+          description:
+            'Factual integration metadata for the app backing this workspace: where its own ' +
+            'native API lives, whether it publishes its own OpenAPI schema, and which ' +
+            'capabilities have been audited and exposed so far. `openapi` and `capabilities` ' +
+            'are empty until that app has been audited in a later pass — this endpoint never ' +
+            'reports a capability the app has not actually been confirmed to support.',
+          parameters: [
+            {
+              name: 'workspace_id',
+              in: 'path',
+              required: true,
+              schema: { type: 'string' },
+              description: 'Workspace ID, e.g. "docs" or "slides".',
+            },
+          ],
+          responses: {
+            200: {
+              description: 'Service integration metadata',
+              content: {
+                'application/json': { schema: { $ref: '#/components/schemas/WorkspaceService' } },
+              },
+            },
+            401: { $ref: '#/components/responses/Unauthorized' },
+            404: { $ref: '#/components/responses/NotFound' },
+          },
+        },
+      },
     },
     components: {
       securitySchemes: {
@@ -201,6 +267,33 @@ export function buildOpenApiDocument() {
           properties: {
             items: { type: 'array', items: { $ref: '#/components/schemas/Workspace' } },
             next_page_token: { type: 'string', nullable: true },
+          },
+        },
+        WorkspaceService: {
+          type: 'object',
+          required: ['id', 'base_path', 'capabilities'],
+          properties: {
+            id: { type: 'string' },
+            base_path: {
+              type: 'string',
+              description: 'Where the app itself is mounted behind this proxy.',
+            },
+            api_base: {
+              type: 'string',
+              nullable: true,
+              description: "Where the app's own native API lives, if known and audited.",
+            },
+            openapi: {
+              type: 'string',
+              nullable: true,
+              description: "Path to this app's own OpenAPI schema, once published.",
+            },
+            capabilities: {
+              type: 'array',
+              items: { type: 'string' },
+              description:
+                'Audited, exposed capabilities of this app\'s native API, e.g. "files.read".',
+            },
           },
         },
         ApiError: {
@@ -274,6 +367,18 @@ export function handleApiRequest(req, res, url, token) {
 
   if (path === '/api/v1/workspaces') {
     apiJson(res, 200, { items: WORKSPACES, next_page_token: null })
+    return true
+  }
+
+  const serviceMatch = path.match(/^\/api\/v1\/workspaces\/([^/]+)\/service$/)
+  if (serviceMatch) {
+    const id = decodeURIComponent(serviceMatch[1])
+    const ws = findWorkspace(id)
+    if (!ws) {
+      apiError(res, 404, 'workspace_not_found', 'Workspace not found.', { workspace_id: id })
+    } else {
+      apiJson(res, 200, toServiceMetadata(ws))
+    }
     return true
   }
 

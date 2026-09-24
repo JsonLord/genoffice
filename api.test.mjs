@@ -61,6 +61,12 @@ test('GET /.well-known/cws.json is unauthenticated and describes the API', async
     assert.equal(body.schema_type, 'openapi')
     assert.equal(body.auth.type, 'bearer')
     assert.ok(!('secret' in body) && !JSON.stringify(body).match(/token/i))
+
+    assert.ok(Array.isArray(body.services))
+    const docs = body.services.find((s) => s.id === 'docs')
+    const slides = body.services.find((s) => s.id === 'slides')
+    assert.deepEqual(docs, { id: 'docs', type: 'app', base_url: '/', native_api: '/api' })
+    assert.deepEqual(slides, { id: 'slides', type: 'app', base_url: '/slides', native_api: null })
   } finally {
     await close(server)
   }
@@ -74,6 +80,7 @@ test('GET /openapi.json is unauthenticated and is a valid-shaped OpenAPI documen
     assert.ok(body.openapi.startsWith('3.'))
     assert.ok(body.paths['/workspaces'])
     assert.ok(body.paths['/health'])
+    assert.ok(body.paths['/workspaces/{workspace_id}/service'])
     const opIds = Object.values(body.paths)
       .flatMap((methods) => Object.values(methods))
       .map((op) => op.operationId)
@@ -143,6 +150,57 @@ test('GET /api/v1/workspaces/{id} 404s on an unknown ID with a structured error'
     assert.equal(status, 404)
     assert.equal(body.error.code, 'workspace_not_found')
     assert.equal(body.error.details.workspace_id, 'does-not-exist')
+  } finally {
+    await close(server)
+  }
+})
+
+test('GET /api/v1/workspaces/{id}/service returns factual, unaudited-by-default metadata', async () => {
+  const server = await makeServer()
+  try {
+    const docs = await request(server, '/api/v1/workspaces/docs/service', { token: TOKEN })
+    assert.equal(docs.status, 200)
+    assert.deepEqual(docs.body, {
+      id: 'docs',
+      base_path: '/',
+      api_base: '/api',
+      openapi: null,
+      capabilities: [],
+    })
+
+    const slides = await request(server, '/api/v1/workspaces/slides/service', { token: TOKEN })
+    assert.equal(slides.status, 200)
+    assert.deepEqual(slides.body, {
+      id: 'slides',
+      base_path: '/slides',
+      api_base: null,
+      openapi: null,
+      capabilities: [],
+    })
+  } finally {
+    await close(server)
+  }
+})
+
+test('GET /api/v1/workspaces/{id}/service requires authentication', async () => {
+  const server = await makeServer()
+  try {
+    const { status, body } = await request(server, '/api/v1/workspaces/docs/service')
+    assert.equal(status, 401)
+    assert.equal(body.error.code, 'unauthorized')
+  } finally {
+    await close(server)
+  }
+})
+
+test('GET /api/v1/workspaces/{id}/service 404s on an unknown workspace', async () => {
+  const server = await makeServer()
+  try {
+    const { status, body } = await request(server, '/api/v1/workspaces/nope/service', {
+      token: TOKEN,
+    })
+    assert.equal(status, 404)
+    assert.equal(body.error.code, 'workspace_not_found')
   } finally {
     await close(server)
   }

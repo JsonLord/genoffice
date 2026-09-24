@@ -118,7 +118,7 @@ RUN npm install --omit=dev
 # ── Supervisor / reverse proxy / API ──────────────────────────────────────
 WORKDIR /app
 RUN npm install --no-save http-proxy@1.18.1
-COPY server.mjs api.mjs ./
+COPY server.mjs api.mjs config.mjs ./
 
 ENV PORT=7860
 EXPOSE 7860
